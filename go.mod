@@ -6,7 +6,7 @@ require (
 	github.com/CycloneDX/cyclonedx-go v0.12.0
 	github.com/DependencyTrack/client-go v0.19.0
 	github.com/fatih/color v1.19.0
-	github.com/github/go-spdx/v2 v2.7.0
+	github.com/github/go-spdx/v2 v2.8.0
 	github.com/go-git/go-billy/v5 v5.9.1
 	github.com/google/uuid v1.6.0
 	github.com/interlynk-io/spdx-zen v0.1.5
