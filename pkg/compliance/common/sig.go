@@ -1,0 +1,286 @@
+// Copyright 2025 Interlynk.io
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package common
+
+import (
+	"bytes"
+	"context"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
+	"encoding/pem"
+	"fmt"
+	"math/big"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/interlynk-io/sbomqs/v2/pkg/logger"
+	"github.com/interlynk-io/sbomqs/v2/pkg/sbom"
+	"github.com/tidwall/sjson"
+	"go.uber.org/zap"
+)
+
+type SBOM struct {
+	Signature *Signature             `json:"signature"`
+	OtherData map[string]interface{} `json:"-"` // Holds the remaining SBOM data
+}
+
+type Signature struct {
+	Algorithm string     `json:"algorithm"`
+	Value     string     `json:"value"`
+	PublicKey *PublicKey `json:"publicKey"`
+}
+
+type PublicKey struct {
+	Kty string `json:"kty"`
+	N   string `json:"n"`
+	E   string `json:"e"`
+}
+
+// signatureArtifactDirPattern names the temporary directory that holds the
+// files extracted from an embedded CycloneDX signature.
+const signatureArtifactDirPattern = "sbomqs-signature-*"
+
+// RemoveSignatureArtifacts deletes files written by RetrieveSignatureFromSBOM
+// and prunes the temporary directory holding them. Paths outside a directory
+// created by RetrieveSignatureFromSBOM are ignored, so it is safe to pass a
+// signature value that is not a path at all.
+func RemoveSignatureArtifacts(paths ...string) {
+	prefix := strings.TrimSuffix(signatureArtifactDirPattern, "*")
+
+	dirs := map[string]struct{}{}
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+
+		dir := filepath.Dir(path)
+		if !strings.HasPrefix(filepath.Base(dir), prefix) {
+			continue
+		}
+
+		RemoveFileIfExists(path)
+		dirs[dir] = struct{}{}
+	}
+
+	for dir := range dirs {
+		// Only succeeds once the directory is empty, which keeps a shared
+		// directory alive until its last artifact is gone.
+		_ = os.Remove(dir)
+	}
+}
+
+func RetrieveSignatureFromSBOM(ctx context.Context, sbomFile string) (string, string, string, error) {
+	log := logger.FromContext(ctx)
+	log.Debug("Retrieving signature from SBOM", zap.String("file", sbomFile))
+	var err error
+
+	// #nosec G304 -- User-provided paths are expected for CLI tool
+	data, err := os.ReadFile(sbomFile)
+	if err != nil {
+		log.Error("Failed to read SBOM file", zap.String("path", sbomFile), zap.Error(err))
+		return "", "", "", fmt.Errorf("error reading SBOM file: %w", err)
+	}
+
+	var sbom SBOM
+
+	if err := json.Unmarshal(data, &sbom); err != nil {
+		log.Error("Failed to parse SBOM json", zap.Error(err))
+		return "", "", "", fmt.Errorf("error unmarshalling SBOM JSON: %w", err)
+	}
+
+	if sbom.Signature == nil {
+		log.Debug("SBOM doesn't contains signature and public key")
+		return sbomFile, "", "", nil
+	}
+	log.Debug("Signature found in SBOM")
+
+	// Artifacts go to a temporary directory. Writing them next to the caller's
+	// working directory left extracted_signature.bin, extracted_public_key.pem
+	// and standalone_sbom.json behind on most code paths, since only two of the
+	// six callers cleaned up and they did so only on one success branch.
+	artifactDir, err := os.MkdirTemp("", signatureArtifactDirPattern)
+	if err != nil {
+		log.Error("Failed to create signature artifact directory", zap.Error(err))
+		return "", "", "", fmt.Errorf("error creating signature artifact directory: %w", err)
+	}
+
+	extractedSignature := filepath.Join(artifactDir, "extracted_signature.bin")
+	extractedPublicKey := filepath.Join(artifactDir, "extracted_public_key.pem")
+	standaloneSBOMFile := filepath.Join(artifactDir, "standalone_sbom.json")
+
+	signatureValue, err := base64.StdEncoding.DecodeString(sbom.Signature.Value)
+	if err != nil {
+		log.Error("Failed to decode signature", zap.Error(err))
+		return "", "", "", fmt.Errorf("error decoding signature: %w", err)
+	}
+
+	if err := os.WriteFile(extractedSignature, signatureValue, 0o600); err != nil {
+		log.Error("Failed to write signature to as file", zap.Error(err))
+	}
+	log.Debug("Signature extracted and written to a file", zap.String("path", extractedSignature))
+
+	// The public key is optional. CycloneDX JSF allows a signature to carry no
+	// inline publicKey, leaving verification material to be referenced by
+	// certPath/keyId or supplied out of band. Dereferencing it unconditionally
+	// panicked on any such document, samples/sbom.cdx.signed.json included.
+	publicKeyPath := ""
+	if sbom.Signature.PublicKey == nil {
+		log.Debug("Signature carries no embedded public key")
+	} else {
+		// extract the public key modulus and exponent
+		modulus, err := base64.StdEncoding.DecodeString(sbom.Signature.PublicKey.N)
+		if err != nil {
+			return "", "", "", fmt.Errorf("error decoding public key modulus: %w", err)
+		}
+		exponent := DecodeBase64URLEncodingToInt(sbom.Signature.PublicKey.E)
+		if exponent == 0 {
+			log.Debug("Invalid public key exponent")
+		}
+
+		// create the RSA public key
+		pubKey := &rsa.PublicKey{
+			N: DecodeBigInt(modulus),
+			E: exponent,
+		}
+
+		pubKeyPEM := PublicKeyToPEM(pubKey)
+		if err := os.WriteFile(extractedPublicKey, pubKeyPEM, 0o600); err != nil {
+			log.Error("Failed to write public key to file", zap.String("path", extractedPublicKey), zap.Error(err))
+		} else {
+			publicKeyPath = extractedPublicKey
+		}
+	}
+
+	// remove the "signature" section
+	modifiedSBOM, err := sjson.DeleteBytes(data, "signature")
+	if err != nil {
+		log.Error("Failed to remove signature section in SBOM", zap.Error(err))
+	}
+
+	var normalizedSBOM bytes.Buffer
+	if err := json.Indent(&normalizedSBOM, modifiedSBOM, "", "  "); err != nil {
+		log.Error("Failed to normalize SBOM JSON", zap.Error(err))
+	}
+
+	// save the modified SBOM to a new file without a trailing newline
+	if err := os.WriteFile(standaloneSBOMFile, bytes.TrimSuffix(normalizedSBOM.Bytes(), []byte("\n")), 0o600); err != nil {
+		return "", "", "", fmt.Errorf("error writing standalone SBOM file: %w", err)
+	}
+
+	log.Debug("New modified SBOM saved to", zap.String("path", standaloneSBOMFile))
+	return standaloneSBOMFile, extractedSignature, publicKeyPath, nil
+}
+
+func DecodeBase64URLEncodingToInt(input string) int {
+	bytes, err := base64.StdEncoding.DecodeString(input)
+	if err != nil {
+		return 0
+	}
+	if len(bytes) == 0 {
+		return 0
+	}
+	result := 0
+	for _, b := range bytes {
+		result = result<<8 + int(b)
+	}
+	return result
+}
+
+func DecodeBigInt(input []byte) *big.Int {
+	result := new(big.Int)
+	result.SetBytes(input)
+	return result
+}
+
+func PublicKeyToPEM(pub *rsa.PublicKey) []byte {
+	pubASN1, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		fmt.Println("Error marshaling public key:", err)
+		return nil
+	}
+	pubPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "PUBLIC KEY",
+		Bytes: pubASN1,
+	})
+	return pubPEM
+}
+
+func GetSignatureBundle(ctx context.Context, sbomFile, signature, publicKey string) (string, string, string, error) {
+	log := logger.FromContext(ctx)
+	log.Debug("Extracting signature bundle from SBOM",
+		zap.String("path", sbomFile),
+		zap.String("signature", signature),
+		zap.String("publickKey", publicKey),
+	)
+
+	// detect SBOM format for signature handling
+	format, err := detectSBOMFormatDirectlyFromSBOMFile(ctx, sbomFile)
+	if err != nil {
+		log.Debug("Failed to detect SBOM format", zap.String("file", sbomFile), zap.Error(err))
+		return "", "", "", fmt.Errorf("cannot determine SBOM format for %s: %w", sbomFile, err)
+	}
+
+	// handle signature extraction based on format
+	switch format {
+
+	case string(sbom.SBOMSpecCDX):
+		log.Debug("CycloneDX SBOM detected, attempting to retrieve signature and public key from embedded SBOM")
+		standaloneSBOMFile, signatureRetrieved, publicKeyRetrieved, err := RetrieveSignatureFromSBOM(ctx, sbomFile)
+		if err != nil {
+			log.Debug("Failed to retrieve signature and public key from embedded sbom", zap.Error(err))
+		}
+		return standaloneSBOMFile, signatureRetrieved, publicKeyRetrieved, nil
+
+	case string(sbom.SBOMSpecSPDX):
+		return sbomFile, signature, publicKey, nil
+
+	default:
+		log.Debug("Unknown SBOM format", zap.String("format", format), zap.String("sbom", sbomFile))
+		return "", "", "", nil
+	}
+}
+
+// detectSBOMFormat attempts to determine if the SBOM is SPDX or CycloneDX by inspecting the file
+func detectSBOMFormatDirectlyFromSBOMFile(ctx context.Context, path string) (string, error) {
+	log := logger.FromContext(ctx)
+	var content []byte
+	var err error
+
+	// #nosec G304 -- User-provided paths are expected for CLI tool
+	content, err = os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("failed to read file %s: %w", path, err)
+	}
+
+	// check for key fields:
+	contentStr := strings.ToLower(string(content))
+
+	// SPDX markers — check first because SPDX 3.0 also uses "specVersion"
+	if strings.Contains(contentStr, "spdxversion") || strings.Contains(contentStr, "spdxid") || strings.Contains(contentStr, "spdxdocument") {
+		log.Debug("Detected SPDX SBOM format")
+		return string(sbom.SBOMSpecSPDX), nil
+	}
+
+	// CycloneDX explicit marker
+	if strings.Contains(contentStr, `"bomformat": "cyclonedx"`) || strings.Contains(contentStr, `"specversion"`) {
+		log.Debug("Detected CycloneDX SBOM format")
+		return string(sbom.SBOMSpecCDX), nil
+	}
+
+	return string(sbom.SBOMSpecUnknown), nil
+}

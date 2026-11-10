@@ -1,0 +1,496 @@
+// Copyright 2025 Interlynk.io
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+package cmd
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"strings"
+
+	"github.com/interlynk-io/sbomqs/v2/pkg/engine"
+	"github.com/interlynk-io/sbomqs/v2/pkg/logger"
+	"github.com/interlynk-io/sbomqs/v2/pkg/reporter"
+	"github.com/samber/lo"
+	"go.uber.org/zap"
+
+	"github.com/spf13/cobra"
+)
+
+var (
+	inFile       string
+	inDirPath    string
+	category     string
+	feature      string
+	reportFormat string
+	configPath   string
+)
+
+type userCmd struct {
+	// input control
+	path []string
+
+	// filter control
+	categories []string
+	features   []string
+
+	// output control
+	json     bool
+	basic    bool
+	detailed bool
+	color    bool
+
+	// directory control
+	recursive bool
+
+	// debug control
+	debug bool
+
+	// config control
+	configPath string
+
+	// profiles
+	profile []string
+
+	// Old scoring
+	legacy bool
+
+	// Interlynk Component Quality API
+	interlynkURL            string
+	interlynkAPIKey         string
+	enableComponentAnalysis bool
+
+	// Signature verification
+	signaturePath string
+	publicKeyPath string
+}
+
+// scoreCmd represents the score command for generating comprehensive quality scores for SBOM documents.
+// It supports various output formats (table, JSON, basic) and can filter by categories and features.
+var scoreCmd = &cobra.Command{
+	Use:          "score [flags] <sbom_file>",
+	Short:        "comprehensive quality score for your sbom",
+	SilenceUsage: true,
+	Example: `sbomqs score [--category <category>] [--basic|--json|--detailed] [--profile <profile>] <SBOM file>
+
+  # Get a score for a SBOM in table output
+  sbomqs score samples/photon.spdx.json
+
+  # Get a score for a SBOM in basic output
+  sbomqs score --basic samples/photon.spdx.json
+
+  # Get a score for a SBOM in JSON output
+  sbomqs score --json samples/photon.spdx.json
+
+  # Get a detailed score for a SBOM
+  sbomqs score --detailed samples/photon.spdx.json
+
+  # Score a SBOM for the ntia (CISA-2026) profile
+  sbomqs score --profile ntia samples/photon.spdx.json
+
+  # Score a SBOM for ntia-2021, bsi, oct-v1.1, interlynk profiles
+  sbomqs score --profile ntia-2021,bsi,oct-v1.1,interlynk samples/photon.spdx.json
+
+  # Get a score for multiple comprehensive categories
+  sbomqs score --category identification,integrity samples/photon.spdx.json
+
+  # Recursively score all SBOMs under a directory
+  sbomqs score --recursive testdata
+
+  # Enable component quality analysis with API key via flag
+  sbomqs score --enable-component-analysis --api-key "your-api-key" samples/photon.spdx.json
+
+  # Enable component quality analysis with API key via environment variable
+  export INTERLYNK_SECURITY_TOKEN="your-api-key"
+  sbomqs score --enable-component-analysis samples/photon.spdx.json
+
+  # Enable component quality analysis with custom API URL
+  sbomqs score --enable-component-analysis --api-url "https://api.interlynk.io" --api-key "your-api-key" samples/photon.spdx.json
+`,
+
+	Args: func(cmd *cobra.Command, args []string) error {
+		if len(args) == 0 && len(inFile) == 0 && len(inDirPath) == 0 {
+			_ = cmd.Help()
+			return fmt.Errorf("please provide a path to an SBOM file or directory")
+		}
+		return nil
+	},
+	RunE: processScore,
+}
+
+var (
+	categoryAliases = map[string]string{
+		"ntia":                  "NTIA-minimum-elements",
+		"NTIA":                  "NTIA-minimum-elements",
+		"ntia-minimum-elements": "NTIA-minimum-elements",
+		"structural":            "Structural",
+		"sharing":               "Sharing",
+		"semantic":              "Semantic",
+		"quality":               "Quality",
+	}
+
+	legacyCategories = []string{
+		"bsi-v1",
+		"NTIA-minimum-elements",
+		"ntia",
+		"Quality",
+		"Semantic",
+		"Sharing",
+		"Structural", // common
+	}
+
+	v2Categories = []string{
+		"identification",
+		"provenance",
+		"integrity",
+		"completeness",
+		"licensing",
+		"vulnerability",
+		"structural", // common
+		"cinfo",
+	}
+)
+
+func processScore(cmd *cobra.Command, args []string) error {
+	debug, _ := cmd.Flags().GetBool("debug")
+
+	// Initialize logger once
+	logger.Init(debug)
+	defer logger.Sync()
+
+	ctx := logger.WithLogger(context.Background())
+	log := logger.FromContext(ctx)
+
+	log.Info("Scoring started")
+
+	uCmd := toUserCmd(cmd, args)
+
+	if err := validateFlags(uCmd); err != nil {
+		return err
+	}
+
+	engParams := toEngineParams(uCmd)
+	err := validateEngineParams(ctx, engParams)
+	if err != nil {
+		return fmt.Errorf("failed to validate engine params: %w", err)
+	}
+
+	return engine.Run(ctx, engParams)
+}
+
+func validateEngineParams(ctx context.Context, ep *engine.Params) error {
+	log := logger.FromContext(ctx)
+	log.Debug("validating engine parameters")
+
+	validPaths := validatePaths(ctx, ep.Path)
+	if len(validPaths) == 0 {
+		return fmt.Errorf("no valid paths provided")
+	}
+	ep.Path = validPaths
+
+	if ep.ConfigPath != "" {
+		if _, err := os.Stat(ep.ConfigPath); err != nil {
+			return fmt.Errorf("invalid config path: %s: %w", ep.ConfigPath, err)
+		}
+	}
+
+	ep.Categories = removeEmptyStrings(ep.Categories)
+	ep.Features = removeEmptyStrings(ep.Features)
+
+	return nil
+}
+
+func removeEmptyStrings(input []string) []string {
+	var result []string
+	for _, s := range input {
+		if trimmed := strings.TrimSpace(s); trimmed != "" {
+			result = append(result, trimmed)
+		}
+	}
+	return result
+}
+
+// validatePaths returns the valid paths.
+func validatePaths(ctx context.Context, paths []string) []string {
+	log := logger.FromContext(ctx)
+	log.Debug("Validating paths")
+
+	var validPaths []string
+	for _, path := range paths {
+		if _, err := os.Stat(path); err != nil {
+			log.Warn("Skipping invalid path", zap.String("path", path), zap.Error(err))
+			continue
+		}
+		validPaths = append(validPaths, path)
+	}
+
+	log.Debug("Path validation completed",
+		zap.Int("valid", len(validPaths)),
+	)
+
+	return validPaths
+}
+
+func toUserCmd(cmd *cobra.Command, args []string) *userCmd {
+	uCmd := &userCmd{}
+
+	// input control
+	if len(args) == 0 {
+		if len(inFile) > 0 {
+			uCmd.path = append(uCmd.path, inFile)
+		}
+
+		if len(inDirPath) > 0 {
+			uCmd.path = append(uCmd.path, inDirPath)
+		}
+	} else {
+		uCmd.path = append(uCmd.path, args[0:]...)
+	}
+
+	// config control
+	if configPath == "" {
+		uCmd.configPath, _ = cmd.Flags().GetString("configpath")
+	} else {
+		uCmd.configPath = configPath
+	}
+	// filter control
+	if category == "" {
+		c, _ := cmd.Flags().GetString("category")
+		cList := strings.Split(c, ",")
+		for i, val := range cList {
+			if fullName, ok := categoryAliases[val]; ok {
+				cList[i] = fullName
+			} else {
+				cList[i] = val
+			}
+		}
+		uCmd.categories = cList
+	}
+
+	if feature == "" {
+		f, _ := cmd.Flags().GetString("feature")
+		uCmd.features = strings.Split(f, ",")
+	}
+
+	// output control
+	uCmd.json, _ = cmd.Flags().GetBool("json")
+	uCmd.basic, _ = cmd.Flags().GetBool("basic")
+	uCmd.detailed, _ = cmd.Flags().GetBool("detailed")
+	uCmd.color, _ = cmd.Flags().GetBool("color")
+	uCmd.legacy, _ = cmd.Flags().GetBool("legacy")
+	uCmd.profile, _ = cmd.Flags().GetStringSlice("profile")
+
+	if reportFormat != "" {
+		uCmd.json = strings.EqualFold(reportFormat, "json")
+		uCmd.basic = strings.EqualFold(reportFormat, "basic")
+		uCmd.detailed = strings.EqualFold(reportFormat, "detailed")
+	}
+
+	// debug control
+	uCmd.debug, _ = cmd.Flags().GetBool("debug")
+
+	// recurssive
+	uCmd.recursive, _ = cmd.Flags().GetBool("recursive")
+
+	// Interlynk Component Quality API
+	uCmd.enableComponentAnalysis, _ = cmd.Flags().GetBool("enable-component-analysis")
+
+	// API URL: --api-url flag > INTERLYNK_API_URL env var > default
+	apiURLFlag, _ := cmd.Flags().GetString("api-url")
+	if apiURLFlag != "" {
+		uCmd.interlynkURL = apiURLFlag
+	} else if urlFlag, _ := cmd.Flags().GetString("url"); urlFlag != "" {
+		// Backward compatibility: --url alias
+		uCmd.interlynkURL = urlFlag
+	} else if envURL := os.Getenv("INTERLYNK_API_URL"); envURL != "" {
+		uCmd.interlynkURL = envURL
+	} else {
+		uCmd.interlynkURL = "https://api.interlynk.io"
+	}
+
+	// API Key: --api-key flag > INTERLYNK_SECURITY_TOKEN env var
+	apiKeyFlag, _ := cmd.Flags().GetString("api-key")
+	if apiKeyFlag != "" {
+		uCmd.interlynkAPIKey = apiKeyFlag
+	} else if envToken := os.Getenv("INTERLYNK_SECURITY_TOKEN"); envToken != "" {
+		uCmd.interlynkAPIKey = envToken
+	}
+
+	// Signature verification
+	uCmd.signaturePath, _ = cmd.Flags().GetString("signature")
+	uCmd.publicKeyPath, _ = cmd.Flags().GetString("public-key")
+
+	return uCmd
+}
+
+func toEngineParams(uCmd *userCmd) *engine.Params {
+	return &engine.Params{
+		Path:                    uCmd.path,
+		Categories:              uCmd.categories,
+		Features:                uCmd.features,
+		JSON:                    uCmd.json,
+		Basic:                   uCmd.basic,
+		Detailed:                uCmd.detailed,
+		Color:                   uCmd.color,
+		Recursive:               uCmd.recursive,
+		Debug:                   uCmd.debug,
+		ConfigPath:              uCmd.configPath,
+		Legacy:                  uCmd.legacy,
+		Profiles:                uCmd.profile,
+		InterlynkURL:            uCmd.interlynkURL,
+		InterlynkAPIKey:         uCmd.interlynkAPIKey,
+		EnableComponentAnalysis: uCmd.enableComponentAnalysis,
+		SignaturePath:           uCmd.signaturePath,
+		PublicKeyPath:           uCmd.publicKeyPath,
+	}
+}
+
+func validatePath(path string) error {
+	if _, err := os.Stat(path); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateFlags(cmd *userCmd) error {
+	if cmd.configPath != "" {
+		if err := validatePath(cmd.configPath); err != nil {
+			return fmt.Errorf("invalid config path: %w", err)
+		}
+	}
+
+	if len(reportFormat) > 0 && !lo.Contains(reporter.ReportFormats, reportFormat) {
+		return fmt.Errorf("invalid report format: %s", reportFormat)
+	}
+
+	// legacy + profile is not allowed
+	if cmd.legacy && len(cmd.profile) > 0 {
+		return fmt.Errorf("flag --profile is not supported in legacy mode; remove --legacy or --profile")
+	}
+
+	if cmd.legacy {
+		for _, c := range cmd.categories {
+			if c == "" {
+				continue
+			}
+
+			if !lo.Contains(legacyCategories, c) {
+				return fmt.Errorf("invalid category %q for legacy mode (allowed: %v)", c, legacyCategories)
+			}
+		}
+	}
+
+	if !cmd.legacy {
+		for _, c := range cmd.categories {
+			if c == "" {
+				continue
+			}
+
+			if !lo.Contains(v2Categories, strings.ToLower(c)) {
+				return fmt.Errorf("invalid category %q for v2 mode (allowed: %v)", c, v2Categories)
+			}
+		}
+	}
+
+	// Validate component analysis requirements
+	if cmd.enableComponentAnalysis {
+		if cmd.interlynkAPIKey == "" {
+			return fmt.Errorf("--enable-component-analysis requires an API key; provide it via --api-key flag or INTERLYNK_SECURITY_TOKEN environment variable")
+		}
+	}
+
+	return nil
+}
+
+func init() {
+	rootCmd.AddCommand(scoreCmd)
+
+	// Config Control
+	scoreCmd.Flags().StringP("configpath", "", "", "scoring based on config path")
+
+	// Filter Control
+	scoreCmd.Flags().StringP("category", "c", "", "filter by category (e.g. 'identification', 'provenance', 'integrity', 'completeness', 'licensing', 'vulnerability', 'structural', 'cinfo')")
+	scoreCmd.Flags().StringP("feature", "f", "", "filter by feature (comma-separated). Features depend on profile: use 'sbom_authors,comp_with_name' for default (Interlynk) or profile-specific keys like 'comp_name,comp_version' with --profile)")
+
+	// Spec Control
+	scoreCmd.Flags().BoolP("spdx", "", false, "limit scoring to spdx sboms")
+	scoreCmd.Flags().BoolP("cdx", "", false, "limit scoring to cdx sboms")
+	scoreCmd.MarkFlagsMutuallyExclusive("spdx", "cdx")
+	err := scoreCmd.Flags().MarkHidden("spdx")
+	if err != nil {
+		log.Fatalf("Failed to mark flag as deprecated: %v", err)
+	}
+	err = scoreCmd.Flags().MarkHidden("cdx")
+	if err != nil {
+		log.Fatalf("Failed to mark flag as deprecated: %v", err)
+	}
+
+	// Directory Control
+	scoreCmd.Flags().BoolP("recursive", "r", false, "recursively search sub-directories for SBOM files (default: false)")
+
+	// Output Control
+	scoreCmd.Flags().BoolP("json", "j", false, "results in json")
+	scoreCmd.Flags().BoolP("detailed", "d", false, "results in table format, default")
+	scoreCmd.Flags().BoolP("basic", "b", false, "results in single line format")
+	scoreCmd.Flags().BoolP("color", "l", false, "output in colorful")
+
+	// Debug Control
+	scoreCmd.Flags().BoolP("debug", "D", false, "enable debug logging")
+
+	// Deprecated
+	scoreCmd.Flags().StringVar(&inFile, "filepath", "", "sbom file path")
+	scoreCmd.Flags().StringVar(&inDirPath, "dirpath", "", "sbom dir path")
+	scoreCmd.MarkFlagsMutuallyExclusive("filepath", "dirpath")
+	scoreCmd.Flags().StringVar(&reportFormat, "reportFormat", "", "reporting format basic/detailed/json")
+
+	err = scoreCmd.Flags().MarkDeprecated("reportFormat", "use --json, --detailed, or --basic instead")
+	if err != nil {
+		log.Fatalf("Failed to mark flag as deprecated: %v", err)
+	}
+
+	err = scoreCmd.Flags().MarkDeprecated("filepath", "use positional argument instead")
+	if err != nil {
+		log.Fatalf("Failed to mark flag as deprecated: %v", err)
+	}
+
+	err = scoreCmd.Flags().MarkDeprecated("dirpath", "use positional argument instead")
+	if err != nil {
+		log.Fatalf("Failed to mark flag as deprecated: %v", err)
+	}
+
+	err = scoreCmd.Flags().MarkDeprecated("dirpath", "use positional argument instead")
+	if err != nil {
+		log.Fatalf("Failed to mark flag as deprecated: %v", err)
+	}
+
+	scoreCmd.Flags().StringSlice("profile", nil, "profiles to run ('ntia' (CISA-2026), 'ntia-2021'|'ntia2021'|'cisa-2021'|'cisa2021', 'cisa-2026'|'cisa'|'cisa2026', 'fsct', 'bsi', 'bsi-v1.1'|'bsiv11', 'bsi-v2.0'|'bsiv20', 'bsi-v2.1'|'bsiv21', 'oct-v1.1'|'octv11'|'oct', 'interlynk')")
+	scoreCmd.Flags().BoolP("legacy", "e", false, "legacy, prior to sbomqs version 2.0")
+
+	// Interlynk Component Quality API
+	scoreCmd.Flags().BoolP("enable-component-analysis", "", false, "enable component quality analysis via Interlynk API (requires --api-key or INTERLYNK_SECURITY_TOKEN)")
+	scoreCmd.Flags().StringP("api-url", "u", "", "Interlynk API URL for component quality analysis (default: https://api.interlynk.io, or INTERLYNK_API_URL env var)")
+	scoreCmd.Flags().StringP("url", "", "", "Interlynk API URL (deprecated: use --api-url)")
+	if err := scoreCmd.Flags().MarkHidden("url"); err != nil {
+		log.Fatalf("Failed to mark flag as hidden: %v", err)
+	}
+	if err := scoreCmd.Flags().MarkDeprecated("url", "use --api-url instead"); err != nil {
+		log.Fatalf("Failed to mark flag as deprecated: %v", err)
+	}
+	scoreCmd.Flags().StringP("api-key", "k", "", "Interlynk API key (or INTERLYNK_SECURITY_TOKEN env var)")
+
+	// Signature verification
+	scoreCmd.Flags().StringP("signature", "", "", "path to detached signature file for SPDX SBOMs")
+	scoreCmd.Flags().StringP("public-key", "", "", "path to public key file for signature verification")
+}

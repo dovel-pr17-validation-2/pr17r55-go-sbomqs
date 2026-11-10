@@ -1,0 +1,729 @@
+# `sbomqs score` Command
+
+The `sbomqs score` command is the primary tool for evaluating SBOM quality. It provides a comprehensive quality score on a 0-10 scale, helping you understand how complete, accurate, and compliant your SBOM is.
+
+## Overview
+
+The score command analyzes your SBOM across multiple categories:
+
+### Version 2.0 Categories (default)
+
+- **Identification**: Component identification and naming
+- **Provenance**: SBOM creation and authorship information
+- **Integrity**: Checksums and verification data
+- **Completeness**: Coverage of key SBOM fields
+- **Licensing**: License information quality
+- **Vulnerability**: Security-related metadata
+- **Structural**: Conformance to SBOM specification standards
+- **Component Quality**: Component quality (API Key Required)
+
+### Legacy Categories (with --legacy flag)
+
+- **NTIA Minimum Elements**: Compliance with NTIA's minimum requirements
+- **Structural**: Conformance to SBOM specification standards
+- **Semantic**: Correctness of SBOM field meanings
+- **Quality**: Completeness and accuracy of data
+- **Sharing**: Readiness for distribution and consumption
+
+If you consume `--legacy` output programmatically or compare its scores against
+another tool, read [Legacy v1 scoring engine: known quirks](../specs/LEGACY-V1-QUIRKS.md)
+first. The legacy `avg_score` does not average only these five categories.
+
+## Usage
+
+```bash
+sbomqs score [flags] <SBOM file(s)>
+```
+
+## Flags
+
+### Output Format Flags
+
+- `--basic, -b`: Output only the numeric score (default: false)
+- `--detailed, -d`: Show detailed breakdown by category and feature (default: true)
+- `--json, -j`: Output in JSON format for automation (default: false)
+- `--color, -l`: Output in colorful format
+
+### Scoring Control Flags
+
+- `--category, -c <category>`: Score only specific categories (comma-separated)
+- `--feature, -f <features>`: Score only specific features (comma-separated)
+- `--configpath <path>`: Use custom scoring configuration file. See [Weightage Scoring Guide](../guides/weightage-scoring.md) for details on creating custom weight configurations.
+- `--profile <profiles>`: Apply specific compliance profiles (comma-separated: 'ntia', 'bsi', 'bsi-v1.1', 'bsi-v2.0', 'bsi-v2.1', 'oct', 'interlynk')
+- `--legacy, -e`: Use legacy scoring mode (prior to sbomqs version 2.0)
+
+### Other Flags
+
+- `--debug, -D`: Enable debug logging
+
+### Component Quality Analysis Flags
+
+- `--enable-component-analysis`: Enable component quality analysis via Interlynk API (requires `--api-key` or `INTERLYNK_SECURITY_TOKEN` environment variable)
+- `--api-url <url>`: Interlynk API endpoint for component quality analysis (optional, default: `https://api.interlynk.io`)
+- `--api-key <token>`: API key for authenticated access to the Interlynk API (optional, can also use `INTERLYNK_SECURITY_TOKEN` environment variable)
+
+**Note:** Component quality analysis is opt-in. You must provide `--enable-component-analysis` flag to enable it. The `--api-url` flag should point to the base URL only (e.g., `https://api.interlynk.io`). The client automatically appends `/api/v1/doctor/check`.
+
+**Backward Compatibility:** The `--url` flag is deprecated but still works as an alias for `--api-url`.
+
+#### Configuration Priority
+
+| Setting | Priority Order |
+|---------|---------------|
+| API URL | `--api-url` flag > `--url` flag (deprecated) > `INTERLYNK_API_URL` environment variable > default (`https://api.interlynk.io`) |
+| API Key | `--api-key` flag > `INTERLYNK_SECURITY_TOKEN` environment variable |
+
+#### Unauthenticated vs Authenticated Access
+
+- **Unauthenticated**: Limited to 50 components per batch, basic checks only
+- **Authenticated**: Up to 5000 components per batch, extended checks including EPSS, KEV, and malicious package detection
+
+### Deprecated Flags
+
+These flags are deprecated but still available for backward compatibility:
+
+- `--filepath <path>`: Use positional argument instead
+- `--dirpath <path>`: Use positional argument instead
+- `--reportFormat <format>`: Use `--json`, `--detailed`, or `--basic` instead
+- `--sbomtype <type>`: Type is auto-detected
+- `--recurse, -r`: Directories are automatically processed
+- `--spdx`: Format is auto-detected
+- `--cdx`: Format is auto-detected
+
+## Categories
+
+### Available Categories
+
+#### Version 2.0 (default)
+
+- `identification`: Component identification quality
+- `provenance`: SBOM creation and authorship
+- `integrity`: Hash and checksum coverage
+- `completeness`: Field completeness metrics
+- `licensing`: License information quality
+- `vulnerability`: Security metadata presence
+- `structural`: Specification conformance
+- `component quality`: Component quality 
+
+#### Legacy Mode (--legacy flag)
+
+- `ntia` or `NTIA`: NTIA minimum elements
+- `structural`: Specification compliance
+- `semantic`: Field correctness  
+- `quality`: Data quality metrics
+- `sharing`: Distribution readiness
+- `bsi-v1`: BSI TR-03183-2 v1.1 scoring
+
+### Available Profiles
+
+- `ntia`: NTIA minimum elements compliance
+- `bsi`: BSI TR-03183-2 compliance (uses latest version, currently v2.1)
+- `bsi-v1.1`: BSI TR-03183-2 v1.1 specific
+- `bsi-v2.0`: BSI TR-03183-2 v2.0 specific
+- `bsi-v2.1`: BSI TR-03183-2 v2.1 specific
+- `oct`: OpenChain Telco compliance
+- `interlynk`: Interlynk comprehensive quality profile
+
+## Examples
+
+### Basic Usage
+
+#### Get a Quick Score
+
+```bash
+$ sbomqs score my-app.spdx.json
+7.2 my-app.spdx.json
+```
+
+#### Score Multiple Files
+
+```bash
+$ sbomqs score *.json --basic
+6.5 app1.spdx.json
+8.1 app2.cdx.json
+7.9 app3.spdx.json
+```
+
+### Detailed Analysis
+
+#### Full Breakdown
+
+```bash
+➜  sbomqs git:(feature/sbomqs-2.0-docs) ✗ ./build/sbomqs score samples/photon.spdx.json
+SBOM Quality Score: 4.1/10.0     Grade: F       Components: 38   EngineVersion: 1       File: samples/photon.spdx.json
+
+Profile Summary Scores:
++-----------------------+----------+-------+
+|        PROFILE        |  SCORE   | GRADE |
++-----------------------+----------+-------+
+| Interlynk Profile     | 4.5/10.0 | F     |
++-----------------------+----------+-------+
+| NTIA Minimum Elements | 7.1/10.0 | C     |
++-----------------------+----------+-------+
+| BSI TR-03183-2 v1.1   | 6.7/10.0 | D     |
++-----------------------+----------+-------+
+
+Interlynk Detailed Score:
++-------------------+--------------------------------+---------------+-------------------------------------+
+|     CATEGORY      |            FEATURE             |     SCORE     |                DESC                 |
++-------------------+--------------------------------+---------------+-------------------------------------+
+| Identification    | comp_with_name                 | 10.0/10.0     | 38/38 have names                    |
++                   +--------------------------------+---------------+-------------------------------------+
+|                   | comp_with_version              | 9.7/10.0      | 37/38 have versions                 |
++                   +--------------------------------+---------------+-------------------------------------+
+|                   | comp_with_identifiers          | 10.0/10.0     | 38/38 have unique IDs               |
++-------------------+--------------------------------+---------------+-------------------------------------+
+| Provenance        | sbom_creation_timestamp        | 10.0/10.0     | 2023-01-12T22:06:03Z                |
++                   +--------------------------------+---------------+-------------------------------------+
+|                   | sbom_authors                   | 0.0/10.0      | missing author                      |
++                   +--------------------------------+---------------+-------------------------------------+
+|                   | sbom_tool_version              | 10.0/10.0     | 1 tool                              |
++                   +--------------------------------+---------------+-------------------------------------+
+|                   | sbom_supplier                  | 0.0/10.0      | N/A (SPDX)                          |
++                   +--------------------------------+---------------+-------------------------------------+
+|                   | sbom_namespace                 | 10.0/10.0     | present namespace                   |
++                   +--------------------------------+---------------+-------------------------------------+
+|                   | sbom_lifecycle                 | 0.0/10.0      | N/A (SPDX)                          |
++-------------------+--------------------------------+---------------+-------------------------------------+
+| Integrity         | comp_with_checksums            | 0.3/10.0      | 1/38 have SHA-1+                    |
++                   +--------------------------------+---------------+-------------------------------------+
+|                   | comp_with_sha256               | 0.3/10.0      | 1/38 have SHA-256+                  |
++                   +--------------------------------+---------------+-------------------------------------+
+|                   | sbom_signature                 | 0.0/10.0      | missing signature                   |
++-------------------+--------------------------------+---------------+-------------------------------------+
+| Completeness      | comp_with_dependencies         | 0.5/10.0      | 2/38 have dependencies              |
++                   +--------------------------------+---------------+-------------------------------------+
+|                   | sbom_completeness_declared     | 0.0/10.0      | N/A (SPDX)                          |
++                   +--------------------------------+---------------+-------------------------------------+
+|                   | primary_component              | 10.0/10.0     | identified                          |
++                   +--------------------------------+---------------+-------------------------------------+
+|                   | comp_with_source_code          | 0.0/10.0      | 0/38 have source URIs               |
++                   +--------------------------------+---------------+-------------------------------------+
+|                   | comp_with_supplier             | 0.0/10.0      | 0/38 have suppliers                 |
++                   +--------------------------------+---------------+-------------------------------------+
+|                   | comp_with_purpose              | 0.0/10.0      | 0/38 have type                      |
++-------------------+--------------------------------+---------------+-------------------------------------+
+| Licensing         | comp_with_licenses             | 0.0/10.0      | 0/38 have licenses                  |
++                   +--------------------------------+---------------+-------------------------------------+
+|                   | comp_with_valid_licenses       | 0.0/10.0      | 0/38 have valid SPDX licenses       |
++                   +--------------------------------+---------------+-------------------------------------+
+|                   | comp_with_declared_licenses    | 9.5/10.0      | 36/38 have declared licenses        |
++                   +--------------------------------+---------------+-------------------------------------+
+|                   | sbom_data_license              | 10.0/10.0     | present data license                |
++                   +--------------------------------+---------------+-------------------------------------+
+|                   | comp_no_deprecated_licenses    | 0.0/10.0      | N/A                                 |
++                   +--------------------------------+---------------+-------------------------------------+
+|                   | comp_no_restrictive_licenses   | 0.0/10.0      | N/A                                 |
++-------------------+--------------------------------+---------------+-------------------------------------+
+| Vulnerability     | comp_with_purl                 | 0.0/10.0      | 0/38 have PURLs                     |
++                   +--------------------------------+---------------+-------------------------------------+
+|                   | comp_with_cpe                  | 0.0/10.0      | 0/38 have CPEs                      |
++-------------------+--------------------------------+---------------+-------------------------------------+
+| Structural        | sbom_spec_declared             | 10.0/10.0     | spdx                                |
++                   +--------------------------------+---------------+-------------------------------------+
+|                   | sbom_spec_version              | 10.0/10.0     | SPDX-2.3                            |
++                   +--------------------------------+---------------+-------------------------------------+
+|                   | sbom_file_format               | 10.0/10.0     | json                                |
++                   +--------------------------------+---------------+-------------------------------------+
+|                   | sbom_schema_valid              | 10.0/10.0     | schema valid                        |
++-------------------+--------------------------------+---------------+-------------------------------------+
+| Component Quality | comp_eol_eos                   | Coming Soon.. | N/A                                 |
++                   +--------------------------------+---------------+-------------------------------------+
+|                   | comp_malicious                 | Coming Soon.. | N/A                                 |
++                   +--------------------------------+---------------+-------------------------------------+
+|                   | comp_vuln_sev_critical         | Coming Soon.. | N/A                                 |
++                   +--------------------------------+---------------+-------------------------------------+
+|                   | comp_kev                       | Coming Soon.. | N/A                                 |
++                   +--------------------------------+---------------+-------------------------------------+
+|                   | comp_purl_valid                | Coming Soon.. | N/A                                 |
++                   +--------------------------------+---------------+-------------------------------------+
+|                   | comp_cpe_valid                 | Coming Soon.. | N/A                                 |
++                   +--------------------------------+---------------+-------------------------------------+
+|                   | NOTE: Register Interest for    |               | https://forms.gle/WVoB3DrX9NKnzfhV8 |
+|                   | Component Analysis             |               |                                     |
++-------------------+--------------------------------+---------------+-------------------------------------+
+
+
+Love to hear your feedback https://forms.gle/anFSspwrk7uSfD7Q6
+```
+
+### Category-Specific Scoring
+
+#### Profile-Based Scoring
+
+```bash
+# NTIA Profile
+$ sbomqs score --profile ntia my-app.spdx.json
+
+# Multiple profiles
+$ sbomqs score --profile ntia,bsi,oct my-app.spdx.json
+
+# BSI v2.1 profile (latest)
+$ sbomqs score --profile bsi-v2.1 my-app.cdx.json
+
+# BSI v2.0 profile
+$ sbomqs score --profile bsi-v2.0 my-app.spdx.json
+```
+
+#### Category-Specific Scoring
+
+```bash
+# Version 2.0 categories
+$ sbomqs score --category identification,integrity my-app.spdx.json
+
+# Legacy mode for NTIA
+$ sbomqs score --legacy --category ntia my-app.spdx.json
+```
+
+#### Specific Feature Scoring
+
+The `--feature` flag allows you to score specific features within a profile context. When used with `--profile`, only profile-specific features are available. When used without `--profile` (default Interlynk profile), comprehensive features are available.
+
+**Default Profile (Interlynk) - Comprehensive Features:**
+
+```bash
+# Score comprehensive features (no profile specified)
+$ sbomqs score --feature comp_with_name,comp_with_version my-app.spdx.json
+```
+
+**Profile-Specific Feature Scoring:**
+
+```bash
+# Score NTIA-specific features
+$ sbomqs score --profile ntia --feature comp_name,comp_version,sbom_timestamp my-app.spdx.json
+
+# Score BSI v2.1-specific features
+$ sbomqs score --profile bsi --feature sbom_spec_version,sbom_creator,comp_name my-app.cdx.json
+
+# Score multiple features with profile
+$ sbomqs score --profile ntia --feature comp_supplier,comp_name,comp_version,comp_uniq_id my-app.spdx.json
+```
+
+##### Profile-Specific Feature Reference
+
+Each profile has its own set of feature keys:
+
+| Profile | Feature Keys |
+|---------|-------------|
+| **ntia** | `comp_supplier`, `comp_name`, `comp_version`, `comp_uniq_id`, `comp_dependencies`, `sbom_relationships`, `sbom_timestamp` |
+| **ntia-2025** | `sbom_machine_format`, `sbom_author`, `software_producer`, `comp_name`, `comp_version`, `software_identifiers`, `comp_hash`, `license`, `sbom_dependencies`, `comp_supplier`, `tool_name`, `sbom_timestamp`, `generation_context` |
+| **bsi-v1.1** | `sbom_creator`, `sbom_timestamp`, `comp_creator`, `comp_name`, `comp_version`, `comp_depth`, `comp_license`, `comp_hash`, `sbom_uri`, `comp_source_url`, `comp_executable_url`, `comp_source_hash`, `comp_unique_identifiers` |
+| **bsi-v2.0** | `sbom_creator`, `sbom_timestamp`, `sbom_uri`, `comp_creator`, `comp_name`, `comp_version`, `comp_filename`, `comp_depth`, `comp_associated_license`, `comp_deployable_hash`, `comp_executable_property`, `comp_archive_property`, `comp_structured_property` |
+| **bsi** (v2.1) | `sbom_spec_version`, `sbom_creator`, `sbom_timestamp`, `sbom_uri`, `comp_creator`, `comp_name`, `comp_version`, `comp_filename`, `comp_depth`, `comp_distribution_license`, `comp_deployable_hash`, `comp_executable_prop`, `comp_archive_prop`, `comp_structured_prop`, `comp_source_code_url`, `comp_download_url`, `comp_other_identifiers`, `comp_original_licenses`, `comp_effective_license`, `comp_source_hash`, `comp_security_txt_url` |
+| **oct-v1.1** | `sbom_spec`, `sbom_spec_version`, `sbom_data_license`, `sbom_identifier`, `sbom_name`, `sbom_namespace`, `sbom_creator`, `sbom_timestamp`, `sbom_creator_comment`, `comp_name`, `comp_identifier`, `comp_version`, `comp_supplier`, `comp_download_location`, `comp_license_concluded`, `comp_license_declared`, `comp_copyright`, `sbom_relationships` |
+| **fsct** | `sbom_provenance`, `sbom_primary_component`, `comp_identity`, `supplier_attribution`, `comp_unique_id`, `artifact_integrity`, `relationships_coverage`, `license_coverage`, `copyright_coverage` |
+
+**Error Messages:**
+If you try to use a feature that doesn't belong to the specified profile, you'll get a helpful error message:
+
+```bash
+$ sbomqs score --profile ntia --feature sbom_spec_version my-app.spdx.json
+Error: feature 'sbom_spec_version' is not evaluated in NTIA Minimum Elements (2021) profile (this feature belongs to: bsi profile); supported features: [comp_supplier comp_name comp_version comp_uniq_id comp_dependencies sbom_relationships sbom_timestamp]
+```
+
+**Feature Scoring Output:**
+When using `--feature`, the output shows a Feature Quality Score with a breakdown table:
+
+```bash
+$ sbomqs score --profile ntia --feature comp_name,comp_version my-app.spdx.json
+Feature Quality Score: 9.9/10.0     Grade: A    Components: 38      EngineVersion: 7    File: my-app.spdx.json
+Profile Context: NTIA Minimum Elements (2021)
+
+Feature Breakdown:
++--------------+-----------+-------+--------------------+
+|   FEATURE    |   SCORE   | GRADE |        DESC        |
++--------------+-----------+-------+--------------------+
+| comp_name    | 10.0/10.0 | A     | complete           |
++--------------+-----------+-------+--------------------+
+| comp_version | 9.7/10.0  | A     | add to 1 component |
++--------------+-----------+-------+--------------------+
+
+Overall: 2/2 NTIA Minimum Elements (2021) requirements passed
+```
+
+**JSON Output for Feature Scoring:**
+
+```bash
+$ sbomqs score --profile ntia --feature comp_name --json my-app.spdx.json
+{
+  "run_id": "...",
+  "files": [{
+    "comprehenssive": [{
+      "category": "Feature Scoring",
+      "score": 10.0,
+      "grade": "A",
+      "features": [{
+        "key": "comp_name",
+        "score": 10.0,
+        "description": "complete",
+        "ignored": false
+      }]
+    }]
+  }]
+}
+```
+
+### Automation-Friendly Output
+
+#### JSON Output for CI/CD
+
+```bash
+➜  sbomqs git:(feature/sbomqs-2.0-docs) ✗ ./build/sbomqs score -j samples/photon.spdx.json
+{
+  "run_id": "d3bfe80c-2cee-48ac-ab4b-e0ff895089f6",
+  "timestamp": "2025-11-18T00:16:16Z",
+  "creation_info": {
+    "name": "sbomqs",
+    "version": "v1.3.0-7-gd3509a9",
+    "sbomqs_engine_version": "1",
+    "vendor": "Interlynk (support@interlynk.io)"
+  },
+  "files": [
+    {
+      "sbom_quality_score": 4.1102469229026655,
+      "grade": "F",
+      "num_components": 38,
+      "file_name": "samples/photon.spdx.json",
+      "spec": "spdx",
+      "spec_version": "SPDX-2.3",
+      "file_format": "json",
+      "creation_time": "2023-01-12T22:06:03Z",
+      "comprehenssive": [
+        
+```
+
+#### Parse JSON in Scripts
+```bash
+# Extract just the score
+score=$(sbomqs score my-app.json --json | jq '.files[0].sbom_quality_score')
+
+# Check if score meets threshold
+if (( $(echo "$score < 7.0" | bc -l) )); then
+    echo "SBOM quality too low: $score"
+    exit 1
+fi
+```
+
+### Custom Configuration
+
+#### Generate Custom Profile
+
+```bash
+# Generate configuration template
+$ sbomqs generate features > custom-profile.yaml
+
+# Edit the file to enable/disable specific checks
+$ vim custom-profile.yaml
+
+# Use custom profile
+$ sbomqs score my-app.json --configpath custom-profile.yaml
+```
+
+**For detailed information on customizing weights, see the [Weightage Scoring Guide](../guides/weightage-scoring.md).**
+
+### Directory Processing
+
+#### Score All SBOMs in Directory
+
+```bash
+$ sbomqs score ./sboms/ --basic
+7.2 sboms/app1.json
+8.5 sboms/app2.json
+6.9 sboms/lib/dependency.json
+```
+
+### Working with Profiles
+
+#### Apply Compliance Profiles
+
+```bash
+# Single profile
+$ sbomqs score --profile ntia my-app.spdx.json
+
+# Multiple profiles
+$ sbomqs score --profile ntia,bsi,oct,interlynk my-app.spdx.json
+
+# BSI profile (defaults to latest v2.1)
+$ sbomqs score --profile bsi samples/app.cdx.json
+
+# BSI v2.0 profile
+$ sbomqs score --profile bsi-v2.0 samples/app.spdx.json
+```
+
+### Component Quality Analysis Examples
+
+#### Enable with Environment Variable
+
+```bash
+# Set Interlynk Security key via environment variable
+export INTERLYNK_SECURITY_TOKEN="your-api-key"
+
+# Enable component quality analysis
+$ sbomqs score --enable-component-analysis my-app.spdx.json
+```
+
+#### Enable with Command Line Flag
+
+```bash
+# Enable with explicit API key
+$ sbomqs score --enable-component-analysis --api-key "your-api-key" my-app.spdx.json
+
+# Enable with custom API URL
+$ sbomqs score --enable-component-analysis --api-url "https://api.interlynk.io" --api-key "your-api-key" my-app.spdx.json
+```
+
+#### Using Custom API Endpoint
+
+```bash
+# Using a local Interlynk instance
+$ sbomqs score --enable-component-analysis --api-url "http://localhost:3000" --api-key "your-local-key" my-app.spdx.json
+```
+
+### Version 2.0 vs Legacy Mode
+
+#### Version 2.0 Mode (Default)
+
+```bash
+# Uses new comprehensive categories
+$ sbomqs score my-app.spdx.json
+
+# Filter by V2 categories
+$ sbomqs score --category identification,integrity my-app.spdx.json
+```
+
+#### Legacy Mode
+
+```bash
+# Use pre-2.0 scoring system
+$ sbomqs score --legacy my-app.spdx.json
+
+# Legacy with NTIA category
+$ sbomqs score --legacy --category ntia my-app.spdx.json
+```
+
+## Interpreting Scores
+
+### Score Ranges and Grades
+
+#### Numeric Scores (0-10)
+
+- **9.0-10.0**: Excellent - SBOM is high quality and compliant
+- **8.0-8.9**: Good - SBOM meets most requirements
+- **7.0-7.9**: Acceptable - SBOM has gaps that should be addressed
+- **5.0-6.9**: Poor - SBOM is missing critical information
+- **below 5.0**: Failing - SBOM is severely incomplete
+
+#### Letter Grades
+
+- **A**: 9.0-10.0 - Excellent quality
+- **B**: 8.0-8.9 - Good quality
+- **C**: 7.0-7.9 - Acceptable quality
+- **D**: 5.0-6.9 - Poor quality
+- **F**: below 5.0 - Failing quality
+
+### Key Quality Indicators
+
+#### High Priority Issues
+
+- Missing component versions (affects vulnerability scanning)
+- No supplier information (supply chain transparency)
+- Invalid or missing licenses (legal compliance)
+- No creation timestamp (traceability)
+
+#### Medium Priority Issues
+
+- Missing checksums (integrity verification)
+- No CPE/PURL identifiers (vulnerability matching)
+- Incomplete relationships (dependency understanding)
+
+## Component Quality Analysis
+
+The Component Quality category analyzes components via the Interlynk API for:
+
+- End-of-Life (EOL) and End-of-Support (EOS) status
+- Malicious package detection
+- Known Exploited Vulnerabilities (KEV)
+- Exploit Prediction Scoring System (EPSS)
+- PURL and CPE validity
+
+**Important:** Component quality analysis is opt-in. You must explicitly enable it with the `--enable-component-analysis` flag and provide an API key.
+
+### API Endpoint Examples
+
+#### Basic Usage with Environment Variable
+
+```bash
+# Set API key via environment variable
+export INTERLYNK_SECURITY_TOKEN="your-api-key"
+
+# Enable component quality analysis
+sbomqs score my-app.spdx.json --enable-component-analysis
+```
+
+#### Using Command Line Flags
+
+```bash
+# Enable with explicit API key
+sbomqs score my-app.spdx.json --enable-component-analysis --api-key "your-api-key"
+
+# Enable with custom API URL
+sbomqs score my-app.spdx.json --enable-component-analysis --api-url "https://api.interlynk.io" --api-key "your-api-key"
+```
+
+#### Local Development
+
+```bash
+# Using a local Interlynk instance
+sbomqs score my-app.spdx.json --enable-component-analysis --api-url="http://localhost:3000" --api-key="your-local-api-key"
+```
+
+### Obtaining an API Token
+
+#### Local Development Token
+
+To obtain token locally:
+
+```bash
+API_KEY=$(RBENV_VERSION=3.4.9 bundle exec rails runner '
+  Rails.cache.clear
+  org = Organization.find_by!(name: "Interlynk")
+  user = User.find_by!(email: "ritesh.noronha@interlynk.io")
+  org_user = OrganizationUser.find_by!(user: user, organization: org)
+  print ApiKey.unexpiring_token(item: org_user, token_name: "sbomqs-local").raw_token
+')
+```
+
+#### Production Token
+
+- Login to <https://app.interlynk.io/>
+- Go to Profile --> Security Token --> Personal Token
+
+### Component Quality Scoring Without API
+
+Without the `--enable-component-analysis` flag, Component Quality features will show as "N/A" or "Coming Soon" in the output. This is the default behavior when you don't need component-level security analysis.
+
+```bash
+# Score without component quality analysis (default)
+sbomqs score my-app.spdx.json
+
+# Score with component quality analysis enabled
+sbomqs score my-app.spdx.json --enable-component-analysis --api-key="$INTERLYNK_SECURITY_TOKEN"
+```
+
+## CI/CD Integration
+
+### GitHub Actions Example
+
+```yaml
+- name: Check SBOM Quality
+  run: |
+    sbomqs score sbom.json --json > results.json
+    score=$(jq '.files[0].sbom_quality_score' results.json)
+    echo "SBOM Score: $score"
+    
+    # Fail if score is below 7
+    if (( $(echo "$score < 7" | bc -l) )); then
+      echo "::error::SBOM quality score too low: $score"
+      exit 1
+    fi
+    
+    # Add score as PR comment
+    echo "## SBOM Quality Score: $score/10" >> $GITHUB_STEP_SUMMARY
+```
+
+### Jenkins Pipeline
+
+```groovy
+stage('SBOM Quality Check') {
+    steps {
+        sh 'sbomqs score build/sbom.json --json > sbom-score.json'
+        
+        script {
+            def scoreData = readJSON file: 'sbom-score.json'
+            def score = scoreData.files[0].sbom_quality_score
+            
+            if (score < 7.0) {
+                error("SBOM quality score too low: ${score}")
+            }
+            
+            echo "SBOM quality score: ${score}/10"
+        }
+    }
+}
+```
+
+## Best Practices
+
+### Regular Quality Checks
+
+```bash
+# Add to pre-commit hooks
+#!/bin/bash
+sbom_score=$(sbomqs score sbom.json --basic | cut -d' ' -f1)
+if (( $(echo "$sbom_score < 7" | bc -l) )); then
+    echo "SBOM quality check failed: score $sbom_score/10"
+    echo "Run 'sbomqs score sbom.json --detailed' for details"
+    exit 1
+fi
+```
+
+### Incremental Improvement
+
+1. Start by checking NTIA compliance:
+
+   ```bash
+   sbomqs score --category ntia sbom.json
+   ```
+
+2. Address missing critical fields:
+
+   ```bash
+   # List components missing versions
+   sbomqs list sbom.json --feature comp_with_version --missing
+   
+   # Check for missing supplier information
+   sbomqs list sbom.json --feature comp_with_supplier --missing
+   ```
+
+3. Improve incrementally and re-score:
+
+   ```bash
+   sbomqs score sbom.json --detailed
+   ```
+
+## Troubleshooting
+
+### Common Issues
+
+#### Low Scores
+
+If you're getting unexpectedly low scores:
+
+1. Check NTIA minimum elements first
+2. Ensure components have versions
+3. Verify license information is present
+4. Add supplier/manufacturer information
+
+#### Parsing Errors
+
+```bash
+# Enable debug mode for more information
+sbomqs score problematic.json --debug
+```
+
+#### Performance with Large SBOMs
+
+```bash
+# Process in basic mode for faster results
+sbomqs score large-sbom.json --basic
+
+# Or use JSON output and process programmatically
+sbomqs score large-sbom.json --json | jq '.files[0].avg_score'
+```
+
+## Related Commands
+
+- [`compliance`](./compliance.md) - Check regulatory compliance
+- [`list`](./list.md) - Analyze specific SBOM features
+- [`share`](./share.md) - Generate shareable score reports
+- [`generate`](./generate.md) - Create custom scoring profiles

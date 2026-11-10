@@ -1,0 +1,1430 @@
+// Copyright 2026 Interlynk.io
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package registry wires together the built-in scoring configuration for sbomqs.
+// It defines all comprehensive categories and compliance profiles, maps their
+// keys to the right evaluation functions, handles aliases, and initializes a
+// Catalog from CLI options or YAML files so the scorer knows what to run.
+package registry
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"strings"
+
+	"github.com/interlynk-io/sbomqs/v2/pkg/logger"
+	"github.com/interlynk-io/sbomqs/v2/pkg/scorer/v2/catalog"
+	"github.com/interlynk-io/sbomqs/v2/pkg/scorer/v2/config"
+	"github.com/interlynk-io/sbomqs/v2/pkg/scorer/v2/extractors"
+	"github.com/interlynk-io/sbomqs/v2/pkg/scorer/v2/profiles"
+	"go.uber.org/zap"
+)
+
+// ComprCatKey lists all comprehenssive catefories
+// e.g. identification, provenance, integrity, etc
+const (
+	CatIdentification         catalog.ComprCatKey = "identification"
+	CatProvenance             catalog.ComprCatKey = "provenance"
+	CatIntegrity              catalog.ComprCatKey = "integrity"
+	CatCompleteness           catalog.ComprCatKey = "completeness"
+	CatLicensingAndCompliance catalog.ComprCatKey = "licensing_and_compliance"
+	CatVulnerabilityAndTrace  catalog.ComprCatKey = "vulnerability_and_traceability"
+	CatStructural             catalog.ComprCatKey = "structural"
+	CatComponentQualityInfo   catalog.ComprCatKey = "component_quality_info" // weight 0
+)
+
+var NTIAKeyToEvaluatingFunction = map[string]catalog.ProfFeatEval{
+	// "sbom_machine_format": profiles.SBOMAutomationSpec,
+	"comp_supplier":      profiles.NTIACompWithSupplier,
+	"comp_name":          profiles.NTIACompWithName,
+	"comp_version":       profiles.NTIACompWithVersion,
+	"comp_uniq_id":       profiles.NTIACompWithUniqID,
+	"sbom_relationships": profiles.NTIASBOMWithDependencyRelationships,
+	"sbom_authors":       profiles.NTIASBOMWithAuthors,
+	"sbom_timestamp":     profiles.NTIASBOMWithTimeStamp,
+}
+
+var FSCTKeyToEvaluatingFunction = map[string]catalog.ProfFeatEval{
+	"sbom_provenance": profiles.FSCTSBOMProvenance,
+	// "sbom_author":    profiles.FSCTSBOMAuthors,
+	// "sbom_timestamp": profiles.FSCTSBOMTimeStamp,
+	// "sbom_build":             profiles.FSCTSBOMBuildLifecycle,
+	"sbom_primary_component": profiles.FSCTSBOMPrimaryComponent,
+	// "comp_name":                profiles.FSCTCompName,
+	// "comp_version":             profiles.FSCTCompVersion,
+	"comp_identity":        profiles.FSCTCompIdentity,
+	"supplier_attribution": profiles.FSCTCompSupplier,
+	"comp_unique_id":       profiles.FSCTCompUniqID,
+	"artifact_integrity":   profiles.FSCTCompChecksum,
+	// "comp_dependencies":      profiles.FSCTCompRelationships,
+	"relationships_coverage": profiles.FSCTSBOMRelationships,
+	"license_coverage":       profiles.FSCTCompLicense,
+	"copyright_coverage":     profiles.FSCTCompCopyright,
+}
+
+var NTIA2025KeyToEvaluatingFunction = map[string]catalog.ProfFeatEval{
+	"sbom_machine_format":  profiles.SBOMAutomationSpec,
+	"sbom_author":          profiles.SBOMAuthors,
+	"software_producer":    profiles.NTIA2025SoftwareProducer,
+	"comp_name":            profiles.CompName,
+	"comp_version":         profiles.CompVersion,
+	"software_identifiers": profiles.NTIA2025CompSoftwareIdentifiers,
+	"comp_hash":            profiles.NTIA2025CompHash,
+	"license":              profiles.NTIA2025CompLicense,
+	"sbom_dependencies":    profiles.SBOMDepedencies,
+	"comp_supplier":        profiles.CompSupplier,
+	"tool_name":            profiles.NTIA2025ToolName,
+	"sbom_timestamp":       profiles.SBOMCreationTimestamp,
+	"generation_context":   profiles.NTIA2025GenerationContext,
+}
+
+var NTIA2026KeyToEvaluatingFunction = map[string]catalog.ProfFeatEval{
+	"sbom_data_format":        profiles.NTIA2026SBOMDataFormat,
+	"sbom_spec_version":       profiles.NTIA2026SBOMSpecVersion,
+	"sbom_author":             profiles.NTIA2026SBOMAuthors,
+	"sbom_tool_name":          profiles.NTIA2026SBOMToolName,
+	"sbom_tool_version":       profiles.NTIA2026SBOMToolVersion,
+	"sbom_version":            profiles.NTIA2026SBOMVersion,
+	"sbom_timestamp":          profiles.NTIA2026SBOMCreationTimestamp,
+	"sbom_generation_context": profiles.NTIA2026GenerationContext,
+	"sbom_relationships":      profiles.NTIA2026SBOMRelationships,
+	"sbom_signature":          profiles.NTIA2026SBOMSignature,
+	"comp_name":               profiles.NTIA2026CompName,
+	"comp_version":            profiles.NTIA2026CompVersion,
+	"comp_uniq_id":            profiles.NTIA2026CompUniqID,
+	"comp_producer":           profiles.NTIA2026CompProducer,
+	"comp_hash_value":         profiles.NTIA2026CompHashValue,
+	"comp_hash_algo":          profiles.NTIA2026CompHashAlgo,
+	"comp_license":            profiles.NTIA2026CompLicense,
+}
+
+var BSIV11KeyToEvaluatingFunction = map[string]catalog.ProfFeatEval{
+	"sbom_creator":   profiles.BSIV11SBOMCreator,
+	"sbom_timestamp": profiles.BSIV11SBOMCreationTimestamp,
+
+	"comp_creator": profiles.BSIV11CompCreator,
+	"comp_name":    profiles.BSIV11CompName,
+	"comp_version": profiles.BSIV11CompVersion,
+	"comp_depth":   profiles.BSIV11CompDependencies,
+	"comp_license": profiles.BSIV11CompLicenses,
+	"comp_hash":    profiles.BSIV11CompExecutableHash,
+
+	// Additional
+	"sbom_uri":                profiles.BSIV11SBOMURI,
+	"comp_source_url":         profiles.BSIV11CompSourceURI,
+	"comp_executable_url":     profiles.BSIV11CompExecutableURI,
+	"comp_source_hash":        profiles.BSIV11CompSourceHash,
+	"comp_unique_identifiers": profiles.BSIV11CompOtherIdentifiers,
+}
+
+var BSIV20KeyToEvaluatingFunction = map[string]catalog.ProfFeatEval{
+	// Required: SBOM level
+	"sbom_spec_version": profiles.BSIV20SpecVersion,
+	"sbom_creator":      profiles.BSIV20SBOMCreator,
+	"sbom_timestamp":    profiles.BSIV20SBOMCreationTimestamp,
+	"sbom_uri":          profiles.BSIV20SBOMURI,
+
+	// Required: component level
+	"comp_creator":             profiles.BSIV20CompCreator,
+	"comp_name":                profiles.BSIV20CompName,
+	"comp_version":             profiles.BSIV20CompVersion,
+	"comp_filename":            profiles.BSIV20CompFilename,
+	"comp_depth":               profiles.BSIV20CompDependencies,
+	"comp_associated_license":  profiles.BSIV20CompAssociatedLicenses,
+	"comp_deployable_hash":     profiles.BSIV20CompDeployableHash,
+	"comp_executable_property": profiles.BSIV20CompExecutableProperty,
+	"comp_archive_property":    profiles.BSIV20CompArchiveProperty,
+	"comp_structured_property": profiles.BSIV20CompStructuredProperty,
+
+	// Additional: SBOM level
+	// Additional: component level
+	"comp_source_code_url":   profiles.BSIV20CompSourceURI,
+	"comp_download_url":      profiles.BSIV20CompDeployableURI,
+	"comp_other_identifiers": profiles.BSIV20CompOtherIdentifiers,
+	"comp_concluded_license": profiles.BSIV20CompConcludedLicenses,
+
+	// Optional: component level
+	"comp_declared_license": profiles.BSIV20CompDeclaredLicenses,
+	"comp_source_hash":      profiles.BSIV20CompSourceHash,
+
+	// // Optional: SBOM level
+	// "sbom_spec":            profiles.SBOMAutomationSpec,
+	// "sbom_signature":       profiles.BSISBOMWithSignature,
+	// "sbom_bomlinks":        profiles.BSISBOMWithBomLinks,
+	// "sbom_vulnerabilities": profiles.BSISBOMWithVulnerabilities,
+	// "comp_license":         profiles.BSICompWithLicenses,
+}
+
+var BSIV21KeyToEvaluatingFunction = map[string]catalog.ProfFeatEval{
+	"sbom_spec_version": profiles.BSIV21SpecVersion,
+	"sbom_creator":      profiles.BSIV11SBOMCreator,
+	"sbom_timestamp":    profiles.BSIV11SBOMCreationTimestamp,
+	"sbom_uri":          profiles.BSIV21SBOMURI,
+
+	"comp_creator":              profiles.BSIV11CompCreator,
+	"comp_name":                 profiles.BSIV11CompName,
+	"comp_version":              profiles.BSIV11CompVersion,
+	"comp_filename":             profiles.BSIV21CompFilename,
+	"comp_depth":                profiles.BSIV20CompDependencies,
+	"comp_distribution_license": profiles.BSIV21CompDistributionLicence,
+	"comp_deployable_hash":      profiles.BSIV21CompDeployableHash,
+	"comp_executable_prop":      profiles.BSIV21CompExecutableProperty,
+	"comp_archive_prop":         profiles.BSIV21CompArchiveProperty,
+	"comp_structured_prop":      profiles.BSIV21CompStructuredProperty,
+	"comp_source_code_url":      profiles.BSIV21CompSourceCodeURI,
+	"comp_download_url":         profiles.BSIV21CompDownloadURI,
+	"comp_other_identifiers":    profiles.BSIV21CompOtherIdentifiers,
+	"comp_original_licenses":    profiles.BSIV21CompOriginalLicences,
+
+	"comp_effective_license": profiles.BSIV21CompEffectiveLicence,
+	"comp_source_hash":       profiles.BSIV21CompSourceHash,
+	"comp_security_txt_url":  profiles.BSIV21CompSecurityTxtURL,
+}
+
+var OCTV11KeyToEvaluatingFunction = map[string]catalog.ProfFeatEval{
+	"sbom_spec":              profiles.OCTV11SBOMSpec,
+	"sbom_spec_version":      profiles.OCTV11SBOMSpecVersion,
+	"sbom_data_license":      profiles.OCTV11SBOMDataLicense,
+	"sbom_identifier":        profiles.OCTV11SBOMIdentifier,
+	"sbom_name":              profiles.OCTV11SBOMName,
+	"sbom_namespace":         profiles.OCTV11SBOMNamespace,
+	"sbom_creator":           profiles.OCTV11SBOMCreator,
+	"sbom_timestamp":         profiles.OCTV11SBOMTimestamp,
+	"sbom_creator_comment":   profiles.OCTV11SBOMCreatorComment,
+	"comp_name":              profiles.OCTV11CompName,
+	"comp_identifier":        profiles.OCTV11CompIdentifier,
+	"comp_version":           profiles.OCTV11CompVersion,
+	"comp_supplier":          profiles.OCTV11CompSupplier,
+	"comp_download_location": profiles.OCTV11CompDownloadLocation,
+	"comp_license_concluded": profiles.OCTV11CompLicenseConcluded,
+	"comp_license_declared":  profiles.OCTV11CompLicenseDeclared,
+	"comp_copyright":         profiles.OCTV11CompCopyright,
+	"sbom_relationships":     profiles.OCTV11SBOMRelationships,
+	"comp_checksum":          profiles.OCTV11CompChecksum,
+	"comp_purl":              profiles.OCTV11CompPURL,
+}
+
+// ProfileSpecificFeatures maps profile keys to their feature keys for feature-level scoring
+var ProfileSpecificFeatures = map[string][]string{
+	// ntia now maps to NTIA 2026 (the updated NTIA)
+	"ntia": {
+		"sbom_data_format", "sbom_spec_version", "sbom_author",
+		"sbom_tool_name", "sbom_tool_version", "sbom_version",
+		"sbom_timestamp", "sbom_generation_context", "sbom_relationships",
+		"sbom_signature", "comp_name", "comp_version", "comp_uniq_id",
+		"comp_producer", "comp_hash_value", "comp_hash_algo", "comp_license",
+	},
+	"ntia-2021": {
+		"comp_supplier", "comp_name", "comp_version", "comp_uniq_id",
+		"comp_dependencies", "sbom_relationships", "sbom_timestamp",
+	},
+	"ntia-2025": {
+		// Profile-specific keys (aliases)
+		"sbom_machine_format", "sbom_author", "software_producer",
+		"comp_name", "comp_version", "software_identifiers", "comp_hash",
+		"license", "sbom_dependencies", "comp_supplier", "tool_name",
+		"sbom_timestamp", "generation_context",
+	},
+	"bsi-v1.1": {
+		"sbom_creator", "sbom_timestamp", "comp_creator", "comp_name",
+		"comp_version", "comp_depth", "comp_license", "comp_hash",
+		"sbom_uri", "comp_source_url", "comp_executable_url", "comp_source_hash",
+		"comp_unique_identifiers",
+	},
+	"bsi-v2.0": {
+		// Profile-specific keys (aliases)
+		"sbom_creator", "sbom_timestamp", "sbom_uri", "comp_creator",
+		"comp_name", "comp_version", "comp_filename", "comp_depth",
+		"comp_associated_license", "comp_deployable_hash", "comp_executable_property",
+		"comp_archive_property", "comp_structured_property",
+	},
+	"bsi": {
+		// Profile-specific keys (aliases)
+		"sbom_spec_version", "sbom_creator", "sbom_timestamp", "sbom_uri",
+		"comp_creator", "comp_name", "comp_version", "comp_filename", "comp_depth",
+		"comp_distribution_license", "comp_deployable_hash", "comp_executable_prop",
+		"comp_archive_prop", "comp_structured_prop", "comp_source_code_url",
+		"comp_download_url", "comp_other_identifiers", "comp_original_licenses",
+		"comp_effective_license", "comp_source_hash", "comp_security_txt_url",
+	},
+	"oct-v1.1": {
+		// Profile-specific keys (aliases)
+		"sbom_spec", "sbom_spec_version", "sbom_data_license", "sbom_identifier",
+		"sbom_name", "sbom_namespace", "sbom_creator", "sbom_timestamp",
+		"sbom_creator_comment", "comp_name", "comp_identifier", "comp_version",
+		"comp_supplier", "comp_download_location", "comp_license_concluded",
+		"comp_license_declared", "comp_copyright", "sbom_relationships",
+	},
+	"fsct": {
+		// Profile-specific keys (aliases)
+		"sbom_provenance", "sbom_primary_component", "comp_identity",
+		"supplier_attribution", "comp_unique_id", "artifact_integrity",
+		"relationships_coverage", "license_coverage", "copyright_coverage",
+	},
+}
+
+var InterlynkKeyToEvaluatingFunction = map[string]catalog.ProfFeatEval{
+	"comp_name":     profiles.InterCompWithName,
+	"comp_version":  profiles.InterCompWithVersion,
+	"comp_local_id": profiles.InterCompWithUniqueID,
+
+	"sbom_timestamp": profiles.InterSBOMTimestamp,
+	"sbom_authors":   profiles.InterSBOMAuthors,
+	"sbom_tool":      profiles.InterSBOMTOol,
+	"sbom_supplier":  profiles.InterSBOMSupplier,
+	"sbom_namespace": profiles.InterSBOMNamespace,
+	"sbom_lifecycle": profiles.InterSBOMLifecycle,
+
+	"comp_checksums": profiles.InterCompWithChecksum,
+	"comp_sha256":    profiles.InterCompWithChecksum265,
+	"sbom_signature": profiles.InterSBOMSignature,
+
+	"comp_dependencies":      profiles.InterCompWithDependencies,
+	"sbom_completeness":      profiles.InterSBOMCompleteness,
+	"sbom_primary_component": profiles.InterSBOMPrimaryComponent,
+	"comp_source_code":       profiles.InterCompWithSourceCode,
+	"comp_supplier":          profiles.InterCompWithSupplier,
+	"comp_purpose":           profiles.InterCompWithPurpose,
+
+	"comp_licenses":                profiles.InterCompWithLicenses,
+	"comp_valid_licenses":          profiles.InterCompWithValidLicenses,
+	"comp_spdx_listed_license":     profiles.InterCompWithSPDXListedLicenses,
+	"comp_no_deprecated_licenses":  profiles.InterCompWithNODeprecatedLicenses,
+	"comp_no_restrictive_licenses": profiles.InterCompWithNORestrictiveLicenses,
+	"comp_declared_licenses":       profiles.InterCompWithDeclaredLicenses,
+	"sbom_data_license":            profiles.InterSBOMDataLicenses,
+
+	"comp_purl": profiles.InterCompWithPURL,
+	"comp_cpe":  profiles.InterCompWithCPE,
+
+	"sbom_spec_declared": profiles.InterSBOMSpec,
+	"sbom_spec_version":  profiles.InterSBOMSpecVersion,
+	"sbom_file_format":   profiles.InterSBOMFileFormat,
+	"sbom_schema_valid":  profiles.InterSBOMSchema,
+}
+
+var CompKeyToEvaluatingFunction = map[string]catalog.ComprFeatEval{
+	// Comprehensive feature keys
+	"comp_with_name":     extractors.CompWithName,
+	"comp_with_version":  extractors.CompWithVersion,
+	"comp_with_local_id": extractors.CompWithUniqLocalIDs,
+
+	"sbom_creation_timestamp": extractors.SBOMCreationTimestamp,
+	"sbom_authors":            extractors.SBOMAuthors,
+	"sbom_tool_version":       extractors.SBOMCreationTool,
+	"sbom_supplier":           extractors.SBOMSupplier,
+	"sbom_namespace":          extractors.SBOMNamespace,
+	"sbom_lifecycle":          extractors.SBOMLifeCycle,
+
+	"comp_with_strong_checksums": extractors.CompWithStrongChecksums,
+	"comp_with_weak_checksums":   extractors.CompWithWeakChecksums,
+	"sbom_signature":             extractors.SBOMSignature,
+
+	"comp_with_dependencies":     extractors.CompWithDependencies,
+	"sbom_completeness_declared": extractors.SBOMWithDeclaredCompleteness,
+	"sbom_primary_component":     extractors.SBOMWithPrimaryComponent,
+	"comp_with_source_code":      extractors.CompWithSourceCode,
+	"comp_with_supplier":         extractors.CompWithSupplier,
+	"comp_with_purpose":          extractors.CompWithPackagePurpose,
+
+	"comp_with_licenses":           extractors.CompWithLicenses,
+	"comp_with_valid_licenses":     extractors.CompWithValidLicenses,
+	"comp_no_deprecated_licenses":  extractors.CompWithDeprecatedLicenses,
+	"comp_no_restrictive_licenses": extractors.CompWithRestrictiveLicenses,
+	"comp_with_declared_licenses":  extractors.CompWithDeclaredLicenses,
+	"sbom_data_license":            extractors.SBOMDataLicense,
+
+	"comp_with_purl":        extractors.CompWithPURL,
+	"comp_with_cpe":         extractors.CompWithCPE,
+	"comp_with_purl_or_cpe": extractors.CompWithPURLOrCPE,
+
+	"sbom_spec_declared":  extractors.SBOMWithSpec,
+	"sbom_spec_version":   extractors.SBOMSpecVersion,
+	"sbom_machine_format": extractors.SBOMWithSpec,
+	"sbom_author":         extractors.SBOMAuthors,
+	"software_producer":   extractors.SBOMSupplier,
+	"tool_name":           extractors.SBOMCreationTool,
+	"generation_context":  extractors.SBOMWithDeclaredCompleteness,
+	"sbom_file_format":    extractors.SBOMFileFormat,
+	"sbom_schema_valid":   extractors.SBOMSchemaValid,
+
+	// Profile-specific feature key aliases (NTIA, BSI, OCT, etc.)
+	"comp_name":                 extractors.CompWithName,
+	"comp_version":              extractors.CompWithVersion,
+	"comp_uniq_id":              extractors.CompWithUniqLocalIDs,
+	"comp_supplier":             extractors.CompWithSupplier,
+	"comp_dependencies":         extractors.CompWithDependencies,
+	"sbom_timestamp":            extractors.SBOMCreationTimestamp,
+	"sbom_relationships":        extractors.CompWithDependencies,
+	"sbom_creator":              extractors.SBOMAuthors,
+	"sbom_uri":                  extractors.SBOMNamespace,
+	"comp_creator":              extractors.SBOMSupplier,
+	"comp_hash":                 extractors.CompWithStrongChecksums,
+	"comp_license":              extractors.CompWithLicenses,
+	"comp_source_url":           extractors.CompWithSourceCode,
+	"comp_executable_url":       extractors.CompWithPackagePurpose,
+	"comp_source_hash":          extractors.CompWithStrongChecksums,
+	"comp_filename":             extractors.CompWithName,
+	"comp_associated_license":   extractors.CompWithLicenses,
+	"comp_deployable_hash":      extractors.CompWithStrongChecksums,
+	"comp_executable_property":  extractors.CompWithPackagePurpose,
+	"comp_archive_property":     extractors.CompWithPackagePurpose,
+	"comp_structured_property":  extractors.CompWithPackagePurpose,
+	"comp_distribution_license": extractors.CompWithLicenses,
+	"comp_executable_prop":      extractors.CompWithPackagePurpose,
+	"comp_archive_prop":         extractors.CompWithPackagePurpose,
+	"comp_structured_prop":      extractors.CompWithPackagePurpose,
+	"comp_download_url":         extractors.CompWithSourceCode,
+	"comp_source_code_url":      extractors.CompWithSourceCode,
+	"comp_other_identifiers":    extractors.CompWithUniqLocalIDs,
+	"comp_original_licenses":    extractors.CompWithLicenses,
+	"comp_effective_license":    extractors.CompWithLicenses,
+	"comp_security_txt_url":     extractors.SBOMNamespace,
+	"comp_identifier":           extractors.CompWithUniqLocalIDs,
+	"comp_download_location":    extractors.CompWithSourceCode,
+	"comp_license_concluded":    extractors.CompWithLicenses,
+	"comp_license_declared":     extractors.CompWithDeclaredLicenses,
+	"comp_copyright":            extractors.CompWithValidLicenses,
+	"comp_checksum":             extractors.CompWithStrongChecksums,
+	"comp_purl":                 extractors.CompWithPURL,
+	"sbom_identifier":           extractors.SBOMNamespace,
+	"sbom_name":                 extractors.SBOMWithSpec,
+	"sbom_creator_comment":      extractors.SBOMAuthors,
+	"sbom_provenance":           extractors.SBOMAuthors,
+	"comp_identity":             extractors.CompWithName,
+	"supplier_attribution":      extractors.CompWithSupplier,
+	"sbom_spec":                 extractors.SBOMWithSpec,
+	"license":                   extractors.CompWithLicenses,
+	"sbom_dependencies":         extractors.CompWithDependencies,
+	"comp_unique_id":            extractors.CompWithUniqLocalIDs,
+	"comp_unique_identifiers":   extractors.CompWithUniqLocalIDs,
+	"comp_depth":                extractors.CompWithDependencies,
+	"software_identifiers":      extractors.CompWithUniqLocalIDs,
+	"artifact_integrity":        extractors.CompWithStrongChecksums,
+	"relationships_coverage":    extractors.CompWithDependencies,
+	"license_coverage":          extractors.CompWithLicenses,
+	"copyright_coverage":        extractors.CompWithValidLicenses,
+}
+
+// ProfileKey lists all profiles
+// e.g. ntia, bsi-v1.1, bsi-v2.0, oct-v1.1, etc
+const (
+	ProfileNTIA      catalog.ProfileKey = "ntia"
+	ProfileNTIA2021  catalog.ProfileKey = "ntia-2021"
+	ProfileNTIA2025  catalog.ProfileKey = "ntia-2025"
+	ProfileNTIA2026  catalog.ProfileKey = "ntia"
+	ProfileBSI11     catalog.ProfileKey = "bsi-v1.1"
+	ProfileBSI20     catalog.ProfileKey = "bsi-v2.0"
+	ProfileBSI21     catalog.ProfileKey = "bsi-v2.1"
+	ProfileOCTV11    catalog.ProfileKey = "oct-v1.1"
+	ProfileInterlynk catalog.ProfileKey = "interlynk"
+	ProfileFSCT      catalog.ProfileKey = "fsct"
+)
+
+var profileAliases = map[string]catalog.ProfileKey{
+	// cisa-2026 and related aliases point to the latest NTIA profile (NTIA Minimum Elements 2026)
+	"cisa-2026":             ProfileNTIA,
+	"CISA-2026":             ProfileNTIA,
+	"cisa2026":              ProfileNTIA,
+	"CISA2026":              ProfileNTIA,
+	"cisa":                  ProfileNTIA,
+	"CISA":                  ProfileNTIA,
+	"ntia-minimum-elements": ProfileNTIA,
+	"NTIA-minimum-elements": ProfileNTIA,
+	"NTIA-Minimum-Elements": ProfileNTIA,
+	"NTIA":                  ProfileNTIA,
+	"ntia-2021":             ProfileNTIA2021,
+	"NTIA-2021":             ProfileNTIA2021,
+	"ntia2021":              ProfileNTIA2021,
+	"NTIA2021":              ProfileNTIA2021,
+	"ntia-2025":             ProfileNTIA2025,
+	"NTIA-2025":             ProfileNTIA2025,
+	"ntia2025":              ProfileNTIA2025,
+	"NTIA2025":              ProfileNTIA2025,
+	"cisa-2021":             ProfileNTIA2021,
+	"CISA-2021":             ProfileNTIA2021,
+	"cisa2021":              ProfileNTIA2021,
+	"CISA2021":              ProfileNTIA2021,
+	"fsct":                  ProfileFSCT,
+	"BSI":                   ProfileBSI21,
+	"bsi":                   ProfileBSI21,
+	"BSI-V1.1":              ProfileBSI11,
+	"bsi-v1.1":              ProfileBSI11,
+	"bsi-v1_1":              ProfileBSI11,
+	"bsiv11":                ProfileBSI11,
+	"BSIV11":                ProfileBSI11,
+	"BSI-V2.0":              ProfileBSI20,
+	"bsi-v2.0":              ProfileBSI20,
+	"bsiv20":                ProfileBSI20,
+	"BSIV20":                ProfileBSI20,
+	"BSI-V2.1":              ProfileBSI21,
+	"bsi-v2.1":              ProfileBSI21,
+	"bsi-v2_1":              ProfileBSI21,
+	"bsiv21":                ProfileBSI21,
+	"BSIV21":                ProfileBSI21,
+	"OCT-V1.1":              ProfileOCTV11,
+	"oct-v1.1":              ProfileOCTV11,
+	"oct-v1_1":              ProfileOCTV11,
+	"octv11":                ProfileOCTV11,
+	"OCTV11":                ProfileOCTV11,
+	"OpenChain-Telco-v1.1":  ProfileOCTV11,
+	"oct":                   ProfileOCTV11,
+	"OCT":                   ProfileOCTV11,
+}
+
+// Returns an error on serious IO / decode failures only.
+func InitializeCatalog(ctx context.Context, conf config.Config) (*catalog.Catalog, error) {
+	log := logger.FromContext(ctx)
+	log.Info("Initializing scoring catalog")
+
+	catal := &catalog.Catalog{}
+	confFile := strings.TrimSpace(conf.ConfigFile)
+
+	// when config file is feeded
+	if confFile != "" {
+		log.Info("Loading catalog from config file",
+			zap.String("config_file", confFile),
+		)
+		categories, profiles, err := mergeConfigFileIntoCatalogYAML(ctx, confFile)
+		if err != nil {
+			log.Error("Failed to load catalog config file",
+				zap.String("config_file", confFile),
+				zap.Error(err),
+			)
+			return nil, fmt.Errorf("failed to load config file %q: %w", confFile, err)
+		}
+
+		if categories != nil {
+			log.Debug("Loaded comprehensive categories from config file",
+				zap.Int("categories", len(categories)),
+			)
+			catal.ComprCategories = categories
+		}
+
+		if profiles != nil {
+			log.Debug("Loaded profiles from config file",
+				zap.Int("profiles", len(profiles)),
+			)
+			catal.Profiles = profiles
+		}
+
+		log.Info("Catalog initialized from config file",
+			zap.Int("categories", len(catal.ComprCategories)),
+			zap.Int("profiles", len(catal.Profiles)),
+		)
+		return catal, nil
+	}
+
+	// Features provided inline (check first, takes precedence over profiles)
+	if len(conf.Features) > 0 {
+		log.Info("Initializing catalog using inline features",
+			zap.Int("requested", len(conf.Features)),
+			zap.Strings("features", conf.Features),
+		)
+
+		// Determine profile context
+		profileContext := "interlynk"
+		if len(conf.Profile) > 0 {
+			profileContext = conf.Profile[0]
+		}
+
+		features, err := filterFeatures(ctx, conf.Features, profileContext)
+		if err != nil {
+			log.Error("Failed to filter features",
+				zap.Error(err),
+			)
+			return nil, err
+		}
+
+		if len(features) > 0 {
+			// Create virtual category for feature-only scoring
+			virtualCategory := catalog.ComprCatSpec{
+				Key:         "feature_scoring",
+				Name:        "Feature Scoring",
+				Weight:      10,
+				Description: "Feature-level scoring",
+				Features:    features,
+			}
+			catal.ComprCategories = []catalog.ComprCatSpec{virtualCategory}
+			catal.ProfileContext = profileContext
+		}
+
+		log.Info("Catalog initialized with features",
+			zap.Int("features", len(features)),
+			zap.String("profile_context", profileContext),
+		)
+
+		return catal, nil
+	}
+
+	// Profiles provided command inline
+	if len(conf.Profile) > 0 {
+		log.Info("Initializing catalog using inline profiles",
+			zap.Int("requested", len(conf.Profile)),
+		)
+
+		profiles, err := filterProfiles(ctx, conf.Profile)
+		if err != nil {
+			log.Info("Initializing catalog using inline profiles",
+				zap.Int("requested", len(conf.Profile)),
+			)
+			return nil, err
+		}
+
+		catal.Profiles = profiles
+		log.Info("Catalog initialized with selected profiles",
+			zap.Int("profiles", len(catal.Profiles)),
+		)
+
+		return catal, nil
+	}
+
+	// Categories provided inline
+	if len(conf.Categories) > 0 {
+		log.Info("Initializing catalog using inline categories",
+			zap.Int("requested", len(conf.Categories)),
+		)
+		catal.ComprCategories = filterCategories(ctx, conf.Categories)
+
+		log.Info("Catalog initialized with selected categories",
+			zap.Int("categories", len(catal.ComprCategories)),
+		)
+		return catal, nil
+	}
+
+	catal.ComprCategories = comprehenssiveCategories
+	catal.Profiles = defaultProfiles
+
+	// Default -> use full comprehensive categories
+	log.Info("Catalog initialized with selected categories",
+		zap.Int("categories", len(catal.ComprCategories)),
+		zap.Bool("component_quality_enabled", conf.EnableComponentAnalysis),
+	)
+
+	return catal, nil
+}
+
+// mergeConfigFileIntoCatalogYAML reads path and merges any found categories/profiles into out.
+// It tries to detect which shape the file has by looking for top-level keys.
+func mergeConfigFileIntoCatalogYAML(ctx context.Context, path string) ([]catalog.ComprCatSpec, []catalog.ProfSpec, error) {
+	log := logger.FromContext(ctx)
+	log.Debug("Processing catalog config file",
+		zap.String("path", path),
+	)
+
+	var cat []catalog.ComprCatSpec
+	var prof []catalog.ProfSpec
+
+	// #nosec G304 -- User-provided paths are expected for CLI tool
+	b, err := os.ReadFile(path)
+	if err != nil {
+		log.Error("Failed to read catalog config file",
+			zap.String("path", path),
+			zap.Error(err),
+		)
+		return nil, nil, err
+	}
+
+	lower := strings.ToLower(string(b))
+
+	// Detect comprehensive categories file
+	if strings.Contains(lower, "categories:") {
+		log.Debug("Detected comprehensive categories config")
+
+		cat, err = ReadComprConfigFile(path)
+		if err != nil {
+			log.Error("Failed to parse comprehensive categories config",
+				zap.String("path", path),
+				zap.Error(err),
+			)
+			return nil, nil, fmt.Errorf("read comprehensive config: %w", err)
+		}
+
+		log.Info("Loaded comprehensive categories from config file",
+			zap.Int("categories", len(cat)),
+		)
+		return cat, nil, nil
+	}
+
+	if strings.Contains(lower, "profiles:") {
+		log.Debug("Detected profiles config")
+
+		prof, err = ReadProfileConfigFile(path)
+		if err != nil {
+			log.Error("Failed to parse profiles config",
+				zap.String("path", path),
+				zap.Error(err),
+			)
+			return nil, nil, fmt.Errorf("read profile config: %w", err)
+		}
+
+		log.Info("Loaded profiles from config file",
+			zap.String("path", path),
+			zap.Int("profiles", len(prof)),
+		)
+		return nil, prof, nil
+	}
+
+	log.Error("Unknown config file format",
+		zap.String("path", path),
+	)
+	return nil, nil, fmt.Errorf("unknown config file, neither categories nor profiles based")
+}
+
+// filterCategories keeps only requested comprehensive categories.
+func filterCategories(ctx context.Context, categories []string) []catalog.ComprCatSpec {
+	log := logger.FromContext(ctx)
+	log.Debug("Filtering requested categories",
+		zap.Int("requested", len(categories)),
+	)
+
+	alreadyExists := make(map[string]bool)
+	var finalCats []catalog.ComprCatSpec
+	var unknown []string
+
+	for _, cat := range categories {
+		if cat == "" {
+			continue
+		}
+
+		category := strings.ToLower(strings.TrimSpace(cat))
+		if alreadyExists[category] {
+			continue
+		}
+		alreadyExists[category] = true
+
+		switch category {
+		case "identification":
+			finalCats = append(finalCats, CatIdentificationSpec)
+
+		case "provenance":
+			finalCats = append(finalCats, CatProvenanceSpec)
+
+		case "integrity":
+			finalCats = append(finalCats, CatIntegritySpec)
+
+		case "completeness":
+			finalCats = append(finalCats, CatCompletenessSpec)
+
+		case "licensing":
+			finalCats = append(finalCats, CatLicensingAndComplianceSpec)
+
+		case "vulnerability":
+			finalCats = append(finalCats, CatVulnerabilityAndTraceSpec)
+
+		case "structural":
+			finalCats = append(finalCats, CatStructuralSpec)
+
+		case "compinfo", "cinfo":
+			finalCats = append(finalCats, CatComponentQualityInfoSpec)
+
+		default:
+			unknown = append(unknown, category)
+		}
+	}
+
+	if len(unknown) > 0 {
+		log.Debug("Filtering requested categories",
+			zap.Int("requested", len(categories)),
+		)
+	}
+
+	log.Debug("Filtering requested categories",
+		zap.Int("requested", len(categories)),
+	)
+	return finalCats
+}
+
+// filterFeatures filters and validates requested features against profile context
+func filterFeatures(ctx context.Context, features []string, profile string) ([]catalog.ComprFeatSpec, error) {
+	log := logger.FromContext(ctx)
+	log.Debug("Filtering requested features",
+		zap.Int("requested", len(features)),
+		zap.String("profile", profile),
+	)
+
+	var finalFeats []catalog.ComprFeatSpec
+	var unknownFeatures []string
+
+	// Normalize profile key (handle aliases like "bsi-v2.1" -> "bsi")
+	normalizedProfile := strings.ToLower(strings.TrimSpace(profile))
+	if alias, ok := profileAliases[normalizedProfile]; ok {
+		normalizedProfile = string(alias)
+	}
+	// Normalize profile keys to match ProfileSpecificFeatures keys
+	switch normalizedProfile {
+	case "bsi-v2.1":
+		normalizedProfile = "bsi"
+	}
+
+	// Build valid features map from comprehensive categories
+	validFeatures := make(map[string]catalog.ComprFeatSpec)
+	for _, cat := range comprehenssiveCategories {
+		for _, feat := range cat.Features {
+			validFeatures[feat.Key] = feat
+		}
+	}
+
+	// Validate each requested feature
+	for _, feat := range features {
+		if feat == "" {
+			continue
+		}
+
+		featureKey := strings.ToLower(strings.TrimSpace(feat))
+
+		// Check if feature is in requested profile (if not interlynk)
+		if normalizedProfile != "interlynk" {
+			profileFeatures, ok := ProfileSpecificFeatures[normalizedProfile]
+			if !ok {
+				return nil, fmt.Errorf("unknown profile: %s", profile)
+			}
+
+			foundInProfile := false
+			for _, k := range profileFeatures {
+				if k == featureKey {
+					foundInProfile = true
+					break
+				}
+			}
+			if !foundInProfile {
+				unknownFeatures = append(unknownFeatures, featureKey)
+				continue
+			}
+		}
+
+		// Check if feature exists in comprehensive categories OR has an evaluator
+		if featSpec, exists := validFeatures[featureKey]; exists {
+			// Get evaluator function from comprehensive features
+			if evalFn, ok := CompKeyToEvaluatingFunction[featureKey]; ok {
+				finalFeats = append(finalFeats, catalog.ComprFeatSpec{
+					Key:         featSpec.Key,
+					Name:        featSpec.Name,
+					Description: featSpec.Description,
+					Weight:      featSpec.Weight,
+					Evaluate:    evalFn,
+				})
+			}
+		} else if evalFn, ok := CompKeyToEvaluatingFunction[featureKey]; ok {
+			// Feature is a profile-specific key that has an evaluator
+			// Get metadata from profile spec if available
+			name := featureKey
+			description := ""
+
+			if normalizedProfile != "interlynk" {
+				if profFeat, found := getProfileFeatureInfo(normalizedProfile, featureKey); found {
+					name = profFeat.Name
+					description = profFeat.Description
+				}
+			}
+
+			finalFeats = append(finalFeats, catalog.ComprFeatSpec{
+				Key:         featureKey,
+				Name:        name,
+				Description: description,
+				Weight:      1.0, // Default weight for profile-specific features
+				Evaluate:    evalFn,
+			})
+		} else {
+			unknownFeatures = append(unknownFeatures, featureKey)
+		}
+	}
+
+	// Handle unknown features
+	if len(unknownFeatures) > 0 {
+		if normalizedProfile != "interlynk" {
+			// Find which profile the unknown feature belongs to
+			suggestedProfile := findFeatureProfile(unknownFeatures[0])
+			// Get supported features for the requested profile
+			supportedFeatures := ProfileSpecificFeatures[normalizedProfile]
+			return nil, fmt.Errorf("feature '%s' is not evaluated in %s profile (this feature belongs to: %s profile); supported features: %v",
+				unknownFeatures[0], getProfileDisplayName(normalizedProfile), suggestedProfile, supportedFeatures)
+		}
+		return nil, fmt.Errorf("unknown feature(s): %v", unknownFeatures)
+	}
+
+	log.Debug("Feature filtering completed",
+		zap.Int("selected", len(finalFeats)),
+	)
+	return finalFeats, nil
+}
+
+// findFeatureProfile finds which profile a feature belongs to
+func findFeatureProfile(feature string) string {
+	for profile, features := range ProfileSpecificFeatures {
+		for _, f := range features {
+			if f == feature {
+				return profile
+			}
+		}
+	}
+	return "interlynk"
+}
+
+// getProfileDisplayName returns human-readable profile name
+func getProfileDisplayName(profile string) string {
+	switch profile {
+	case "ntia", "cisa-2026", "cisa2026", "CISA2026", "cisa", "CISA":
+		return "NTIA Minimum Elements (2026)"
+
+	case "ntia-2021", "ntia2021", "NTIA2021", "cisa-2021", "cisa2021":
+		return "NTIA Minimum Elements (2021)"
+
+	case "ntia-2025":
+		return "NTIA Minimum Elements (2025) - Initial Draft"
+
+	case "bsi-v1.1", "bsi-v1_1", "bsiv11":
+		return "BSI TR-03183-2 v1.1"
+
+	case "bsi-v2.0", "bsi-v2_0", "bsiv20":
+		return "BSI TR-03183-2 v2.0"
+
+	case "bsi", "bsi-v2.1", "bsi-v2_1", "bsiv21":
+		return "BSI TR-03183-2 v2.1"
+
+	case "oct-v1.1", "oct-v1_1", "octv11", "OCTV11", "oct", "OCT":
+		return "OpenChain Telco v1.1"
+
+	case "fsct":
+		return "Framing 3rd Edition"
+
+	case "interlynk":
+		return "Interlynk Comprehensive"
+
+	default:
+		return profile
+	}
+}
+
+// filterProfiles keeps only requested profile keys (preserving order).
+func filterProfiles(ctx context.Context, profiles []string) ([]catalog.ProfSpec, error) {
+	log := logger.FromContext(ctx)
+	log.Debug("Filtering requested profiles",
+		zap.Int("requested", len(profiles)),
+	)
+
+	alreadyExists := make(map[string]bool)
+	finalProfiles := make([]catalog.ProfSpec, 0, len(profiles))
+	var unknown []string
+
+	for _, pro := range profiles {
+		if pro == "" {
+			continue
+		}
+
+		profile := strings.ToLower(strings.TrimSpace(pro))
+		if alreadyExists[profile] {
+			continue
+		}
+		alreadyExists[profile] = true
+
+		switch profile {
+
+		case string(ProfileNTIA), "cisa2026", "CISA2026", "cisa", "CISA":
+			finalProfiles = append(finalProfiles, profileNTIASpec)
+
+		case string(ProfileNTIA2021), "ntia2021", "NTIA2021", "cisa-2021", "cisa2021", "CISA-2021", "CISA2021":
+			finalProfiles = append(finalProfiles, profileNTIA2021Spec)
+
+		case string(ProfileNTIA2025):
+			finalProfiles = append(finalProfiles, profileNTIA2025Spec)
+
+		case string(ProfileFSCT):
+			finalProfiles = append(finalProfiles, profileFSCTSpec)
+
+		case "bsi":
+			finalProfiles = append(finalProfiles, profileBSI21Spec)
+
+		case string(ProfileBSI11), "bsi-v1_1", "bsiv11":
+			finalProfiles = append(finalProfiles, profileBSI11Spec)
+
+		case string(ProfileBSI20), "bsi-v2_0", "bsiv20":
+			finalProfiles = append(finalProfiles, profileBSI20Spec)
+
+		case string(ProfileBSI21), "bsi-v2_1", "bsiv21":
+			finalProfiles = append(finalProfiles, profileBSI21Spec)
+
+		case string(ProfileOCTV11), "oct-v1_1", "octv11", "OCTV11", "oct", "OCT":
+			finalProfiles = append(finalProfiles, profileOCTV11Spec)
+
+		case string(ProfileInterlynk):
+			finalProfiles = append(finalProfiles, profileInterlynkSpec)
+
+		default:
+			unknown = append(unknown, profile)
+		}
+	}
+
+	if len(unknown) > 0 {
+		log.Error("Unknown profile(s) requested",
+			zap.Strings("profiles", unknown),
+		)
+		return nil, fmt.Errorf("unknown profile(s): %v", unknown)
+	}
+	log.Debug("Profile filtering completed",
+		zap.Int("selected", len(finalProfiles)),
+	)
+
+	return finalProfiles, nil
+}
+
+var CatIdentificationSpec = catalog.ComprCatSpec{
+	Key:         "identification",
+	Name:        "Identification",
+	Weight:      10,
+	Description: "Identification of components is critical for understanding supply chain metadata",
+	Features: []catalog.ComprFeatSpec{
+		{Key: "comp_with_name", Name: "Component With Name", Weight: 0.40, Ignore: false, Evaluate: extractors.CompWithName},
+		{Key: "comp_with_version", Name: "Component With Version", Weight: 0.35, Ignore: false, Evaluate: extractors.CompWithVersion}, // FIXED: was mapped to completeness
+		{Key: "comp_with_local_id", Name: "Component With Local IDs", Weight: 0.25, Ignore: false, Evaluate: extractors.CompWithUniqLocalIDs},
+	},
+}
+
+var CatProvenanceSpec = catalog.ComprCatSpec{
+	Key:         "provenance",
+	Name:        "Provenance",
+	Description: "Enables trust and audit trails",
+	Weight:      12,
+	Features: []catalog.ComprFeatSpec{
+		{Key: "sbom_creation_timestamp", Name: "Document Creation Time", Weight: 0.20, Ignore: false, Evaluate: extractors.SBOMCreationTimestamp},
+		{Key: "sbom_authors", Name: "Document Authors", Weight: 0.20, Ignore: false, Evaluate: extractors.SBOMAuthors},
+		{Key: "sbom_tool_version", Name: "Document Creator Tool & Version", Weight: 0.20, Ignore: false, Evaluate: extractors.SBOMCreationTool},
+		{Key: "sbom_supplier", Name: "Document Supplier", Weight: 0.15, Ignore: false, Evaluate: extractors.SBOMSupplier},
+		{Key: "sbom_namespace", Name: "Document URI/Namespace", Weight: 0.15, Ignore: false, Evaluate: extractors.SBOMNamespace},
+		{Key: "sbom_lifecycle", Name: "Document Lifecycle", Weight: 0.10, Ignore: false, Evaluate: extractors.SBOMLifeCycle},
+	},
+}
+
+var CatIntegritySpec = catalog.ComprCatSpec{
+	Key:         "integrity",
+	Name:        "Integrity",
+	Description: "Allows for verification if artifacts were altered",
+	Weight:      15,
+	Features: []catalog.ComprFeatSpec{
+		{Key: "comp_with_strong_checksums", Name: "Component With Strong Checksums", Weight: 0.50, Ignore: false, Evaluate: extractors.CompWithStrongChecksums},
+		{Key: "comp_with_weak_checksums", Name: "Component With Weak Checksums", Weight: 0.40, Ignore: false, Evaluate: extractors.CompWithWeakChecksums},
+		{Key: "sbom_signature", Name: "Document Signature", Weight: 0.10, Ignore: false, Evaluate: extractors.SBOMSignature},
+	},
+}
+
+var CatCompletenessSpec = catalog.ComprCatSpec{
+	Key:         "completeness",
+	Name:        "Completeness",
+	Description: "Allows for vulnerability and impact analysis",
+	Weight:      12,
+	Features: []catalog.ComprFeatSpec{
+		{Key: "comp_with_dependencies", Name: "Component With Dependencies", Weight: 0.25, Ignore: false, Evaluate: extractors.CompWithDependencies},
+		{Key: "sbom_completeness_declared", Name: "Component With Declared Completeness", Weight: 0.15, Ignore: false, Evaluate: extractors.SBOMWithDeclaredCompleteness},
+		{Key: "sbom_primary_component", Name: "Primary Component", Weight: 0.20, Ignore: false, Evaluate: extractors.SBOMWithPrimaryComponent},
+		{Key: "comp_with_source_code", Name: "Component With Source Code", Weight: 0.15, Ignore: false, Evaluate: extractors.CompWithSourceCode},
+		{Key: "comp_with_supplier", Name: "Component With Supplier", Weight: 0.15, Ignore: false, Evaluate: extractors.CompWithSupplier},
+		{Key: "comp_with_purpose", Name: "Component With Primary Purpose", Weight: 0.10, Ignore: false, Evaluate: extractors.CompWithPackagePurpose},
+	},
+}
+
+var CatLicensingAndComplianceSpec = catalog.ComprCatSpec{
+	Key:         "licensing_and_compliance",
+	Name:        "Licensing",
+	Description: "Determines redistribution rights and legal compliance",
+	Weight:      15,
+	Features: []catalog.ComprFeatSpec{
+		{Key: "comp_with_licenses", Name: "Components With Licenses", Weight: 0.20, Ignore: false, Evaluate: extractors.CompWithLicenses},
+		{Key: "comp_with_valid_licenses", Name: "Component With Valid Licenses", Weight: 0.20, Ignore: false, Evaluate: extractors.CompWithValidLicenses},
+		{Key: "comp_spdx_listed_license", Name: "Component SPDX Listed License", Weight: 0.20, Ignore: false, Evaluate: extractors.CompWithSPDXListedLicenses},
+		{Key: "comp_no_deprecated_licenses", Name: "Component Without Deprecated Licenses", Weight: 0.15, Ignore: false, Evaluate: extractors.CompWithDeprecatedLicenses},
+		{Key: "comp_no_restrictive_licenses", Name: "Component Without Restrictive Licenses", Weight: 0.20, Ignore: false, Evaluate: extractors.CompWithRestrictiveLicenses},
+		{Key: "comp_with_declared_licenses", Name: "Component With Original Licenses", Weight: 0.15, Ignore: false, Evaluate: extractors.CompWithDeclaredLicenses},
+		{Key: "sbom_data_license", Name: "Document Data License", Weight: 0.10, Ignore: false, Evaluate: extractors.SBOMDataLicense},
+	},
+}
+
+var CatVulnerabilityAndTraceSpec = catalog.ComprCatSpec{
+	Key:         "vulnerability_and_traceability",
+	Name:        "Vulnerability",
+	Description: "Ability to map components to vulnerability databases",
+	Weight:      10,
+	Features: []catalog.ComprFeatSpec{
+		{Key: "comp_with_purl", Name: "Component With PURL", Weight: 0.33, Ignore: false, Evaluate: extractors.CompWithPURL, OrGroup: "vuln_id"},
+		{Key: "comp_with_cpe", Name: "Component With CPE", Weight: 0.33, Ignore: false, Evaluate: extractors.CompWithCPE, OrGroup: "vuln_id"},
+		{Key: "comp_with_purl_or_cpe", Name: "Component With PURL or CPE (Union)", Weight: 0.34, Ignore: false, Evaluate: extractors.CompWithPURLOrCPE, OrGroup: "vuln_id"},
+	},
+}
+
+var CatStructuralSpec = catalog.ComprCatSpec{
+	Key:         "structural",
+	Name:        "Structural",
+	Description: "If a BOM can't be reliably parsed, all downstream automation fails",
+	Weight:      8,
+	Features: []catalog.ComprFeatSpec{
+		{Key: "sbom_spec_declared", Name: "SBOM Spec", Weight: 0.30, Ignore: false, Evaluate: extractors.SBOMWithSpec},
+		{Key: "sbom_spec_version", Name: "SBOM Spec Version", Weight: 0.30, Ignore: false, Evaluate: extractors.SBOMSpecVersion},
+		{Key: "sbom_file_format", Name: "SBOM File Format", Weight: 0.20, Ignore: false, Evaluate: extractors.SBOMFileFormat},
+		{Key: "sbom_schema_valid", Name: "Schema Validation", Weight: 0.20, Ignore: false, Evaluate: extractors.SBOMSchemaValid},
+	},
+}
+
+var CatComponentQualityInfoSpec = catalog.ComprCatSpec{
+	Key:         "compinfo",
+	Name:        "Component Quality",
+	Weight:      10,
+	Description: "Component identifier validation via Interlynk API. These metrics are informational only and do NOT affect the overall quality score",
+	Features: []catalog.ComprFeatSpec{
+		// Features without Evaluate functions are not yet supported by the API
+		{Key: "comp_eol_eos", Name: "Component No Longer Maintained or Declared EOL", Description: "Not yet available", Weight: 0.10, Ignore: true, Evaluate: nil},
+		{Key: "comp_malicious", Name: "Component tagged as malicious in threat databases", Description: "Not yet available", Weight: 0.15, Ignore: true, Evaluate: nil},
+		{Key: "comp_vuln_sev_critical", Name: "Component with critical vulnerabilities", Description: "Not yet available", Weight: 0.15, Ignore: true, Evaluate: nil},
+		{Key: "comp_kev", Name: "Component which are actively exploited (CISA KEV)", Description: "Not yet available", Weight: 0.15, Ignore: true, Evaluate: nil},
+		// Working features
+		{Key: "comp_purl_valid", Name: "Component PURL Valid", Description: "PURL resolves to a package manager or repository", Weight: 0.225, Ignore: true, Evaluate: extractors.CompWithPurlValid},
+		{Key: "comp_cpe_valid", Name: "Component CPE Valid", Description: "CPE is found in NVD CPE database", Weight: 0.225, Ignore: true, Evaluate: extractors.CompWithCpeValid},
+	},
+}
+
+var comprehenssiveCategories = []catalog.ComprCatSpec{
+	CatIdentificationSpec,
+	CatProvenanceSpec,
+	CatIntegritySpec,
+	CatCompletenessSpec,
+	CatLicensingAndComplianceSpec,
+	CatVulnerabilityAndTraceSpec,
+	CatStructuralSpec,
+	CatComponentQualityInfoSpec,
+}
+
+var defaultProfiles = []catalog.ProfSpec{
+	profileInterlynkSpec,
+	profileNTIASpec, // now CISA 2026 (latest NTIA)
+	profileFSCTSpec,
+	profileBSI11Spec,
+	profileOCTV11Spec,
+}
+
+var profileInterlynkSpec = catalog.ProfSpec{
+	Key:         ProfileInterlynk,
+	Name:        "Interlynk",
+	Description: "Interlynk Scoring Profile",
+	Features: []catalog.ProfFeatSpec{
+		{Key: "comp_name", Name: "Component Name", Description: "components with name", Required: true, Evaluate: profiles.InterCompWithName},
+		{Key: "comp_version", Name: "Component Version", Description: "components with version", Required: true, Evaluate: profiles.InterCompWithVersion},
+		{Key: "comp_local_id", Name: "Component Local IDs", Description: "components with local identifiers", Required: true, Evaluate: profiles.InterCompWithUniqueID},
+
+		{Key: "sbom_timestamp", Name: "SBOM Creation Tome", Description: "Document creation time", Required: true, Evaluate: profiles.InterSBOMTimestamp},
+		{Key: "sbom_authors", Name: "SBOM Authors", Description: "Document authors", Required: true, Evaluate: profiles.InterSBOMAuthors},
+		{Key: "sbom_tool", Name: "SBOM Creation Tool", Description: "Document creator tool & version", Required: true, Evaluate: profiles.InterSBOMTOol},
+		{Key: "sbom_supplier", Name: "SBOM Supplier", Description: "Document supplier", Required: true, Evaluate: profiles.InterSBOMSupplier},
+		{Key: "sbom_namespace", Name: "SBOM Namespace", Description: "Document URI/namespace", Required: true, Evaluate: profiles.InterSBOMNamespace},
+		{Key: "sbom_lifecycle", Name: "SBOM Lifecycle", Description: "Document Lifecycle", Required: true, Evaluate: profiles.InterSBOMLifecycle},
+
+		{Key: "comp_checksums", Name: "Component Chekcsum", Description: "components with checksums", Required: true, Evaluate: profiles.InterCompWithChecksum},
+		{Key: "comp_sha256", Name: "Component Checksum SHA256", Description: "components with SHA-256+", Required: true, Evaluate: profiles.InterCompWithChecksum265},
+		{Key: "sbom_signature", Name: "SBOM Signature", Description: "Document signature	", Required: true, Evaluate: profiles.InterSBOMSignature},
+
+		{Key: "comp_dependencies", Name: "Component Dependencies", Description: "components with dependencies", Required: true, Evaluate: profiles.InterCompWithDependencies},
+		{Key: "sbom_completeness", Name: "SBOM Completeness ", Description: "components with declared completeness", Required: true, Evaluate: profiles.InterSBOMCompleteness},
+		{Key: "sbom_primary_component", Name: "Primary Component", Description: "Primary component identified", Required: true, Evaluate: profiles.InterSBOMPrimaryComponent},
+		{Key: "comp_source_code", Name: "Component Source Code", Description: "components with source code", Required: true, Evaluate: profiles.InterCompWithSourceCode},
+		{Key: "comp_supplier", Name: "Component Supplier", Description: "components with supplier", Required: true, Evaluate: profiles.InterCompWithSupplier},
+		{Key: "comp_purpose", Name: "Component Type", Description: "components with primary purpose", Required: true, Evaluate: profiles.InterCompWithPurpose},
+
+		{Key: "comp_licenses", Name: "Component License", Description: "components with licenses", Required: true, Evaluate: profiles.InterCompWithLicenses},
+		{Key: "comp_valid_licenses", Name: "Component Valid License", Description: "components with valid SPDX expression syntax (accepts LicenseRef-*)", Required: true, Evaluate: profiles.InterCompWithValidLicenses},
+		{Key: "comp_spdx_listed_license", Name: "Component SPDX Listed License", Description: "components with SPDX standard listed licenses", Required: true, Evaluate: profiles.InterCompWithSPDXListedLicenses},
+		{Key: "comp_no_deprecated_licenses", Name: "Component With No Deprecated License", Description: "components without deprecated licenses", Required: true, Evaluate: profiles.InterCompWithNODeprecatedLicenses},
+		{Key: "comp_no_restrictive_licenses", Name: "Component With No Restrictive License", Description: "components without restrictive licenses", Required: true, Evaluate: profiles.InterCompWithNORestrictiveLicenses},
+		{Key: "comp_declared_licenses", Name: "Component Declared License", Description: "components with original licenses", Required: true, Evaluate: profiles.InterCompWithDeclaredLicenses},
+		{Key: "sbom_data_license", Name: "SBOM Data License", Description: "Document data license", Required: true, Evaluate: profiles.InterSBOMDataLicenses},
+
+		{Key: "comp_purl", Name: "Component PURL", Description: "components with PURL", Required: true, Evaluate: profiles.InterCompWithPURL},
+		{Key: "comp_cpe", Name: "Component CPE", Description: "components with CPE", Required: true, Evaluate: profiles.InterCompWithCPE},
+
+		{Key: "sbom_spec_declared", Name: "SBOM Spec", Description: "SBOM spec declared", Required: true, Evaluate: profiles.InterSBOMSpec},
+		{Key: "sbom_spec_version", Name: "SBOM Spec Version", Description: "SBOM spec version", Required: true, Evaluate: profiles.InterSBOMSpecVersion},
+		{Key: "sbom_file_format", Name: "SBOM File Format", Description: "SBOM file format", Required: true, Evaluate: profiles.InterSBOMFileFormat},
+		{Key: "sbom_schema_valid", Name: "SBOM Schema", Description: "Schema validation", Required: true, Evaluate: profiles.InterSBOMSchema},
+	},
+}
+
+// profileNTIASpec is the latest NTIA profile, which now maps to CISA 2026 Minimum Elements.
+var profileNTIASpec = catalog.ProfSpec{
+	Key:         ProfileNTIA,
+	Name:        "NTIA Minimum Elements (2026)",
+	Description: "NTIA Minimum Elements (2026) Profile",
+	Features: []catalog.ProfFeatSpec{
+		// SBOM Metadata
+		{Key: "sbom_data_format", Name: "Data Format", Required: true, Description: "Valid spec (SPDX/CycloneDX) and format (JSON/XML)", Evaluate: profiles.NTIA2026SBOMDataFormat},
+		{Key: "sbom_spec_version", Name: "SBOM Spec Version", Required: true, Description: "Version of the SBOM specification used", Evaluate: profiles.NTIA2026SBOMSpecVersion},
+		{Key: "sbom_author", Name: "SBOM Author", Required: true, Description: "Person or organization who created SBOM (tool entries not accepted)", Evaluate: profiles.NTIA2026SBOMAuthors},
+		{Key: "sbom_tool_name", Name: "SBOM Tool Name", Required: true, Description: "Name of the tool that generated the SBOM", Evaluate: profiles.NTIA2026SBOMToolName},
+		{Key: "sbom_tool_version", Name: "SBOM Tool Version", Required: true, Description: "Version of the tool that generated the SBOM", Evaluate: profiles.NTIA2026SBOMToolVersion},
+		{Key: "sbom_version", Name: "SBOM Version", Required: true, Description: "Author-assigned version of the SBOM document", Evaluate: profiles.NTIA2026SBOMVersion},
+		{Key: "sbom_timestamp", Name: "SBOM Timestamp", Required: true, Description: "ISO 8601 creation timestamp", Evaluate: profiles.NTIA2026SBOMCreationTimestamp},
+		{Key: "sbom_generation_context", Name: "SBOM Generation Context", Required: true, Description: "Context describing how the SBOM was generated", Evaluate: profiles.NTIA2026GenerationContext},
+		{Key: "sbom_relationships", Name: "SBOM Relationships", Required: true, Description: "Dependency relationships for the primary component", Evaluate: profiles.NTIA2026SBOMRelationships},
+		{Key: "sbom_signature", Name: "SBOM Author Signature", Required: true, Description: "Digital signature on the SBOM document", Evaluate: profiles.NTIA2026SBOMSignature},
+		// Component Data
+		{Key: "comp_name", Name: "Component Name", Required: true, Description: "Name assigned to each component", Evaluate: profiles.NTIA2026CompName},
+		{Key: "comp_version", Name: "Component Version", Required: true, Description: "Version strings for all components", Evaluate: profiles.NTIA2026CompVersion},
+		{Key: "comp_uniq_id", Name: "Component Other Identifiers", Required: true, Description: "PURL, CPE, SWID, SWHID, or OmniBOR ID", Evaluate: profiles.NTIA2026CompUniqID},
+		{Key: "comp_producer", Name: "Component Producer", Required: true, Description: "Entity that produced the component (manufacturer or author)", Evaluate: profiles.NTIA2026CompProducer},
+		{Key: "comp_hash_value", Name: "Component Hash Value", Required: true, Description: "Cryptographic hash value for each component", Evaluate: profiles.NTIA2026CompHashValue},
+		{Key: "comp_hash_algo", Name: "Component Hash Algorithm", Required: true, Description: "Cryptographic hash algorithm for each component", Evaluate: profiles.NTIA2026CompHashAlgo},
+		{Key: "comp_license", Name: "Component License", Required: true, Description: "Declared license information for each component", Evaluate: profiles.NTIA2026CompLicense},
+	},
+}
+
+var profileNTIA2021Spec = catalog.ProfSpec{
+	Key:         ProfileNTIA2021,
+	Name:        "NTIA Minimum Elements (2021)",
+	Description: "NTIA Minimum Elements (2021) Profile",
+	Features: []catalog.ProfFeatSpec{
+		// Required (SHALL) fields
+		// {Key: "sbom_machine_format", Name: "Automation Support", Required: true, Description: "Valid spec (SPDX/CycloneDX) and format (JSON/XML)", Evaluate: profiles.SBOMAutomationSpec},
+		{Key: "comp_supplier", Name: "Supplier Name", Required: true, Description: "Component supplier information", Evaluate: profiles.NTIACompWithSupplier},
+		{Key: "comp_name", Name: "Component Name", Required: true, Description: "All components must have names", Evaluate: profiles.NTIACompWithName},
+		{Key: "comp_version", Name: "Component Version", Required: true, Description: "Version strings for all components", Evaluate: profiles.NTIACompWithVersion},
+		{Key: "comp_uniq_id", Name: "Component Other Identifiers", Required: true, Description: "PURL, CPE, or other unique IDs", Evaluate: profiles.NTIACompWithUniqID},
+		{Key: "sbom_relationships", Name: "SBOM Relationships", Required: true, Description: "SBOM direct relationship for primary element", Evaluate: profiles.NTIASBOMWithDependencyRelationships},
+		{Key: "sbom_authors", Name: "SBOM Author", Required: true, Description: "Tool or person who created SBOM", Evaluate: profiles.NTIASBOMWithAuthors},
+		{Key: "sbom_timestamp", Name: "SBOM Timestamp", Required: true, Description: "ISO 8601 creation timestamp", Evaluate: profiles.NTIASBOMWithTimeStamp},
+		// Optional (SHOULD) fields - don't impact score
+		// {Key: "comp_hash", Name: "Component Hash", Required: false, Description: "Component checksums (optional)", Evaluate: profiles.NTIACompHash},
+		// {Key: "sbom_lifecycle", Name: "Lifecycle Phase", Required: false, Description: "SBOM lifecycle phase (optional)", Evaluate: profiles.NTIASBOMLifecycle},
+		// {Key: "comp_license", Name: "License Information", Required: false, Description: "Component licenses (optional)", Evaluate: profiles.NTIACompLicense},
+	},
+}
+
+var profileNTIA2025Spec = catalog.ProfSpec{
+	Key:         ProfileNTIA2025,
+	Name:        "NTIA Minimum Elements (2025) - Initial Draft",
+	Description: "NTIA Minimum Elements 2025 Profile (Initial Draft - superseded by CISA 2026)",
+	Features: []catalog.ProfFeatSpec{
+		{Key: "sbom_machine_format", Name: "Machine-Readable Formats", Required: true, Description: "Valid spec (SPDX/CycloneDX) and format (JSON/XML)", Evaluate: profiles.SBOMAutomationSpec},
+		{Key: "sbom_author", Name: "SBOM Author", Required: true, Description: "Tool or person who created SBOM", Evaluate: profiles.SBOMAuthors},
+		{Key: "software_producer", Name: "Software Producer", Required: true, Description: "Entity that produced the software", Evaluate: profiles.NTIA2025SoftwareProducer},
+		{Key: "comp_name", Name: "Component Name", Required: true, Description: "All components must have names", Evaluate: profiles.CompName},
+		{Key: "comp_version", Name: "Component Version", Required: true, Description: "Version strings for all components", Evaluate: profiles.CompVersion},
+		{Key: "software_identifiers", Name: "Software Identifiers", Required: true, Description: "SPDX ID, PURL, CPE, or SWID", Evaluate: profiles.NTIA2025CompSoftwareIdentifiers},
+		{Key: "comp_hash", Name: "Component Hash", Required: true, Description: "Checksums for all components", Evaluate: profiles.NTIA2025CompHash},
+		{Key: "license", Name: "License", Required: true, Description: "License information for components", Evaluate: profiles.NTIA2025CompLicense},
+		{Key: "sbom_dependencies", Name: "Dependency Relationship", Required: true, Description: "Component dependency mapping", Evaluate: profiles.SBOMDepedencies},
+		{Key: "comp_supplier", Name: "Component Supplier", Required: true, Description: "Supplier information for components", Evaluate: profiles.CompSupplier},
+		{Key: "tool_name", Name: "Tool Name", Required: true, Description: "Name of the tool that created SBOM", Evaluate: profiles.NTIA2025ToolName},
+		{Key: "sbom_timestamp", Name: "Timestamp", Required: true, Description: "ISO 8601 creation timestamp", Evaluate: profiles.SBOMCreationTimestamp},
+		{Key: "generation_context", Name: "Generation Context", Required: true, Description: "Context of SBOM generation", Evaluate: profiles.NTIA2025GenerationContext},
+	},
+}
+
+var profileFSCTSpec = catalog.ProfSpec{
+	Key:         ProfileFSCT,
+	Name:        "Framing 3rd Edition Compliance",
+	Description: "Framing Third Edition Compliance Profile",
+	Features: []catalog.ProfFeatSpec{
+		// Required (SHALL) fieldsM
+		{Key: "sbom_provenance", Name: "SBOM Provenance", Required: true, Description: "SBOM Author and SBOM Timestamp to be present", Evaluate: profiles.FSCTSBOMProvenance},
+		// {Key: "sbom_timestamp", Name: "SBOM Timestamp", Required: true, Description: "ISO 8601 creation timestamp", Evaluate: profiles.FSCTSBOMTimeStamp},
+		{Key: "sbom_primary_component", Name: "Primary Component", Required: true, Description: "Primary Component for which SBOM is created", Evaluate: profiles.FSCTSBOMPrimaryComponent},
+		{Key: "comp_identity", Name: "Component Identity", Required: true, Description: "All components should have names and version", Evaluate: profiles.FSCTCompIdentity},
+		// {Key: "comp_version", Name: "Component Version", Required: true, Description: "Version strings for all components", Evaluate: profiles.FSCTCompVersion},
+		{Key: "supplier_attribution", Name: "Component Supplier", Required: true, Description: "Component supplier info", Evaluate: profiles.FSCTCompSupplier},
+		{Key: "comp_unique_id", Name: "Component Other Identifiers", Required: true, Description: "PURL, CPE, or other unique IDs", Evaluate: profiles.FSCTCompUniqID},
+		{Key: "artifact_integrity", Name: "Component Hash", Required: true, Description: "Component checksums", Evaluate: profiles.FSCTCompChecksum},
+		// {Key: "comp_dependencies", Name: "Component Dependencies", Required: true, Description: "Dependency relationships", Evaluate: profiles.FSCTCompRelationships},
+		{Key: "relationships_coverage", Name: "SBOM Relationships", Required: true, Description: "Dependency relationships", Evaluate: profiles.FSCTSBOMRelationships},
+		{Key: "license_coverage", Name: "License Information", Required: true, Description: "Component licenses (optional)", Evaluate: profiles.FSCTCompLicense},
+		{Key: "copyright_coverage", Name: "Copyright Text", Required: true, Description: "Copyright information", Evaluate: profiles.FSCTCompCopyright},
+
+		// Optional (SHOULD) fields - don't impact score
+		// {Key: "sbom_build", Name: "Build Information", Required: false, Description: "Build phase indication", Evaluate: profiles.FSCTSBOMBuildLifecycle},
+	},
+}
+
+var profileBSI11Spec = catalog.ProfSpec{
+	Key:         ProfileBSI11,
+	Name:        "BSI TR-03183-2 v1.1",
+	Description: "BSI TR-03183-2 v1.1 Profile",
+	Features: []catalog.ProfFeatSpec{
+		{Key: "sbom_creator", Name: "SBOM Creator Info", Required: true, Description: "Contact email/URL", Evaluate: profiles.BSIV11SBOMCreator},
+		{Key: "sbom_timestamp", Name: "Creation Time", Required: true, Description: "Valid timestamp (ISO-8601)", Evaluate: profiles.BSIV11SBOMCreationTimestamp},
+
+		{Key: "comp_creator", Name: "Component Creator", Required: true, Description: "Creator of each component", Evaluate: profiles.BSIV11CompCreator},
+		{Key: "comp_name", Name: "Component Name", Required: true, Description: "All components named", Evaluate: profiles.BSIV11CompName},
+		{Key: "comp_version", Name: "Component Version", Required: true, Description: "Version for each component", Evaluate: profiles.BSIV11CompVersion},
+		{Key: "comp_depth", Name: "Component Dependencies", Required: true, Description: "Dependency relationships", Evaluate: profiles.BSIV11CompDependencies},
+		{Key: "comp_license", Name: "Component License", Required: true, Description: "License information", Evaluate: profiles.BSIV11CompLicenses},
+		{Key: "comp_hash", Name: "Component Hash", Required: true, Description: "Checksums for components", Evaluate: profiles.BSIV11CompExecutableHash},
+
+		// Additional (§5.3): conditional mandatory — MUST be present if data exists
+		{Key: "sbom_uri", Name: "URI/Namespace", Required: false, Additional: true, Description: "Unique SBOM identifier", Evaluate: profiles.BSIV11SBOMURI},
+		{Key: "comp_source_url", Name: "Component Source URL", Required: false, Additional: true, Description: "Source code repository", Evaluate: profiles.BSIV11CompSourceURI},
+		{Key: "comp_executable_url", Name: "Component Download URL", Required: false, Additional: true, Description: "Where to obtain component", Evaluate: profiles.BSIV11CompExecutableURI},
+		{Key: "comp_source_hash", Name: "Component Source Hash", Required: false, Additional: true, Description: "Hash of source code", Evaluate: profiles.BSIV11CompSourceHash},
+		{Key: "comp_unique_identifiers", Name: "Component Other Unique Identifiers", Required: false, Additional: true, Description: "Unique Identifiers of the component", Evaluate: profiles.BSIV11CompOtherIdentifiers},
+	},
+}
+
+var profileBSI20Spec = catalog.ProfSpec{
+	Key:         ProfileBSI20,
+	Name:        "BSI TR-03183-2 v2.0",
+	Description: "BSI TR-03183-2 v2.0 Profile",
+	Features: []catalog.ProfFeatSpec{
+		// Required: SBOM level (5.2.1)
+		{Key: "sbom_spec_version", Name: "Spec Version", Required: true, Description: "CDX >= 1.5 or SPDX >= 2.2.1", Evaluate: profiles.BSIV20SpecVersion},
+		{Key: "sbom_creator", Name: "Creator Info", Required: true, Description: "Contact email or URL", Evaluate: profiles.BSIV20SBOMCreator},
+		{Key: "sbom_timestamp", Name: "Creation Time", Required: true, Description: "Valid RFC 3339 timestamp", Evaluate: profiles.BSIV20SBOMCreationTimestamp},
+
+		// Required: component level (5.2.2)
+		{Key: "comp_creator", Name: "Component Creator", Required: true, Description: "Creator email or URL per component", Evaluate: profiles.BSIV20CompCreator},
+		{Key: "comp_name", Name: "Component Name", Required: true, Description: "All components named (filename fallback)", Evaluate: profiles.BSIV20CompName},
+		{Key: "comp_version", Name: "Component Version", Required: true, Description: "Version or creation-date fallback", Evaluate: profiles.BSIV20CompVersion},
+		{Key: "comp_filename", Name: "Component Filename", Required: true, Description: "Actual filename of the component", Evaluate: profiles.BSIV20CompFilename},
+		{Key: "comp_depth", Name: "Component Dependencies", Required: true, Description: "Direct deps and contained components", Evaluate: profiles.BSIV20CompDependencies},
+		{Key: "comp_associated_license", Name: "Associated Licences", Required: true, Description: "Valid SPDX licence per component", Evaluate: profiles.BSIV20CompAssociatedLicenses},
+		{Key: "comp_deployable_hash", Name: "Deployable Hash", Required: true, Description: "Hash on externalReferences type=distribution or distribution-intake", Evaluate: profiles.BSIV20CompDeployableHash},
+		{Key: "comp_executable_property", Name: "Executable Property", Required: true, Description: "executable or non-executable", Evaluate: profiles.BSIV20CompExecutableProperty},
+		{Key: "comp_archive_property", Name: "Archive Property", Required: true, Description: "archive or no archive", Evaluate: profiles.BSIV20CompArchiveProperty},
+		{Key: "comp_structured_property", Name: "Structured Property", Required: true, Description: "structured or unstructured", Evaluate: profiles.BSIV20CompStructuredProperty},
+
+		// Additional (§5.3): SBOM level (5.3.1) — conditional mandatory
+		{Key: "sbom_uri", Name: "SBOM URI", Required: false, Additional: true, Description: "Unique SBOM document identifier", Evaluate: profiles.BSIV20SBOMURI},
+
+		// Additional (§5.3): component level (5.3.2) — conditional mandatory
+		{Key: "comp_source_code_url", Name: "Source Code URI", Required: false, Additional: true, Description: "Source code repository URL", Evaluate: profiles.BSIV20CompSourceURI},
+		{Key: "comp_download_url", Name: "Deployable URI", Required: false, Additional: true, Description: "Download URL for deliverable", Evaluate: profiles.BSIV20CompDeployableURI},
+		{Key: "comp_other_identifiers", Name: "Other Unique Identifiers", Required: false, Additional: true, Description: "CPE and/or PURL", Evaluate: profiles.BSIV20CompOtherIdentifiers},
+		{Key: "comp_concluded_license", Name: "Concluded/Orignal Licences", Required: false, Additional: true, Description: "Licensee-chosen licence per component", Evaluate: profiles.BSIV20CompConcludedLicenses},
+
+		// Optional (§5.4): component level (5.4.1) — truly optional, never affects score
+		{Key: "comp_declared_license", Name: "Declared Licences", Required: false, Additional: false, Description: "Licensor-declared licence per component", Evaluate: profiles.BSIV20CompDeclaredLicenses},
+		{Key: "comp_source_hash", Name: "Source Code Hash", Required: false, Additional: false, Description: "Hash of component source code", Evaluate: profiles.BSIV20CompSourceHash},
+
+		// // BSI v2.0 additional governance checks
+		// {Key: "sbom_signature", Name: "Digital Signature", Required: false, Description: "Cryptographic signature of SBOM", Evaluate: profiles.BSISBOMWithSignature},
+		// {Key: "sbom_bomlinks", Name: "BOM Links", Required: false, Description: "Links to external SBOMs", Evaluate: profiles.BSISBOMWithBomLinks},
+		// {Key: "sbom_vulnerabilities", Name: "Vulnerability Info", Required: false, Description: "Absence of vuln data (MUST NOT be present)", Evaluate: profiles.BSISBOMWithVulnerabilities},
+	},
+}
+
+var profileBSI21Spec = catalog.ProfSpec{
+	Key:         ProfileBSI21,
+	Name:        "BSI TR-03183-2 v2.1",
+	Description: "BSI TR-03183-2 v2.1.0 Profile",
+	Features: []catalog.ProfFeatSpec{
+		// Required (SHALL) SBOM fields
+		{Key: "sbom_spec_version", Name: "Spec Version", Required: true, Description: "CDX >= 1.6 or SPDX >= 3.0.1", Evaluate: profiles.BSIV21SpecVersion},
+		{Key: "sbom_creator", Name: "Creator Info", Required: true, Description: "Contact email/URL", Evaluate: profiles.BSIV11SBOMCreator},
+		{Key: "sbom_timestamp", Name: "Creation Time", Required: true, Description: "Valid timestamp (ISO-8601)", Evaluate: profiles.BSIV11SBOMCreationTimestamp},
+
+		// Required (SHALL) Component fields
+		{Key: "comp_creator", Name: "Component Creator", Required: true, Description: "Creator email/URL for each component", Evaluate: profiles.BSIV11CompCreator},
+		{Key: "comp_name", Name: "Component Name", Required: true, Description: "All components named", Evaluate: profiles.BSIV20CompName},
+		{Key: "comp_version", Name: "Component Version", Required: true, Description: "Version for each component", Evaluate: profiles.BSIV20CompVersion},
+		{Key: "comp_filename", Name: "Component Filename", Required: true, Description: "Filename via bsi:component:filename property", Evaluate: profiles.BSIV21CompFilename},
+		{Key: "comp_depth", Name: "Component Dependencies", Required: true, Description: "Dependency relationships", Evaluate: profiles.BSIV20CompDependencies},
+		{Key: "comp_distribution_license", Name: "Distribution Licence", Required: true, Description: "Concluded licence (acknowledgement=concluded)", Evaluate: profiles.BSIV21CompDistributionLicence},
+		{Key: "comp_deployable_hash", Name: "Deployable Hash", Required: true, Description: "Hash on externalReferences type=distribution or distribution-intake", Evaluate: profiles.BSIV21CompDeployableHash},
+		{Key: "comp_executable_prop", Name: "Executable Property", Required: true, Description: "bsi:component:executable property", Evaluate: profiles.BSIV21CompExecutableProperty},
+		{Key: "comp_archive_prop", Name: "Archive Property", Required: true, Description: "bsi:component:archive property", Evaluate: profiles.BSIV21CompArchiveProperty},
+		{Key: "comp_structured_prop", Name: "Structured Property", Required: true, Description: "bsi:component:structured property", Evaluate: profiles.BSIV21CompStructuredProperty},
+
+		// Additional(§5.2): SBOM level
+		{Key: "sbom_uri", Name: "SBOM-URI", Required: false, Additional: true, Description: "Unique SBOM identifier", Evaluate: profiles.BSIV21SBOMURI},
+
+		// Additional(§5.2): Component level
+		{Key: "comp_source_code_url", Name: "Source Code URI", Required: false, Additional: true, Description: "externalReferences type=source-distribution URL", Evaluate: profiles.BSIV21CompSourceCodeURI},
+		{Key: "comp_download_url", Name: "Deployable Form URI", Required: false, Additional: true, Description: "externalReferences type=distribution URL", Evaluate: profiles.BSIV21CompDownloadURI},
+		{Key: "comp_other_identifiers", Name: "Unique Identifiers", Required: false, Additional: true, Description: "CPE, SWID, or purl", Evaluate: profiles.BSIV21CompOtherIdentifiers},
+		{Key: "comp_original_licenses", Name: "Declared/Original Licences", Required: false, Additional: true, Description: "Declared licence (acknowledgement=declared)", Evaluate: profiles.BSIV21CompOriginalLicences},
+
+		// Optional(§5.4) (MAY) Component fields
+		{Key: "comp_effective_license", Name: "Effective Licence", Required: false, Additional: false, Description: "bsi:component:effectiveLicense property", Evaluate: profiles.BSIV21CompEffectiveLicence},
+		{Key: "comp_source_hash", Name: "Source Code Hash", Required: false, Additional: false, Description: "Hash on externalReferences type=source-distribution", Evaluate: profiles.BSIV21CompSourceHash},
+		{Key: "comp_security_txt_url", Name: "Security.txt URL", Required: false, Additional: false, Description: "externalReferences type=rfc-9116", Evaluate: profiles.BSIV21CompSecurityTxtURL},
+	},
+}
+
+var profileOCTV11Spec = catalog.ProfSpec{
+	Key:         ProfileOCTV11,
+	Name:        "OpenChain Telco v1.1",
+	Description: "OpenChain Telco SBOM Guide v1.1 Profile",
+	Features: []catalog.ProfFeatSpec{
+		// Document Creation Information - SHALL
+		{Key: "sbom_spec", Name: "SBOM Format", Required: true, Description: "SPDX or CycloneDX format", Evaluate: profiles.OCTV11SBOMSpec},
+		{Key: "sbom_spec_version", Name: "Spec Version", Required: true, Description: "Valid spec version", Evaluate: profiles.OCTV11SBOMSpecVersion},
+		{Key: "sbom_data_license", Name: "Data License", Required: true, Description: "License for SBOM data", Evaluate: profiles.OCTV11SBOMDataLicense},
+		{Key: "sbom_identifier", Name: "Document Identifier", Required: true, Description: "SPDX ID or serial number", Evaluate: profiles.OCTV11SBOMIdentifier},
+		{Key: "sbom_name", Name: "Document Name", Required: true, Description: "SBOM document name", Evaluate: profiles.OCTV11SBOMName},
+		{Key: "sbom_namespace", Name: "Document Namespace", Required: true, Description: "Unique namespace URI", Evaluate: profiles.OCTV11SBOMNamespace},
+		{Key: "sbom_creator", Name: "Creator", Required: true, Description: "Organization and tool info", Evaluate: profiles.OCTV11SBOMCreator},
+		{Key: "sbom_timestamp", Name: "Created Timestamp", Required: true, Description: "ISO 8601 creation time", Evaluate: profiles.OCTV11SBOMTimestamp},
+		{Key: "sbom_creator_comment", Name: "Creator Comment", Required: true, Description: "Build information or lifecycle", Evaluate: profiles.OCTV11SBOMCreatorComment},
+
+		// Package Information - SHALL
+		{Key: "comp_name", Name: "Package Name", Required: true, Description: "All components named", Evaluate: profiles.OCTV11CompName},
+		{Key: "comp_identifier", Name: "Package Identifier", Required: true, Description: "SPDX ID or bom-ref", Evaluate: profiles.OCTV11CompIdentifier},
+		{Key: "comp_version", Name: "Package Version", Required: true, Description: "Version for each component", Evaluate: profiles.OCTV11CompVersion},
+		{Key: "comp_supplier", Name: "Package Supplier", Required: true, Description: "Component supplier info", Evaluate: profiles.OCTV11CompSupplier},
+		{Key: "comp_download_location", Name: "Download Location", Required: true, Description: "Where to obtain component", Evaluate: profiles.OCTV11CompDownloadLocation},
+		{Key: "comp_license_concluded", Name: "License Concluded", Required: true, Description: "Concluded license info", Evaluate: profiles.OCTV11CompLicenseConcluded},
+		{Key: "comp_license_declared", Name: "License Declared", Required: true, Description: "Declared license info", Evaluate: profiles.OCTV11CompLicenseDeclared},
+		{Key: "comp_copyright", Name: "Copyright Text", Required: true, Description: "Copyright information", Evaluate: profiles.OCTV11CompCopyright},
+		{Key: "sbom_relationships", Name: "Relationships", Required: true, Description: "Dependencies and relationships", Evaluate: profiles.OCTV11SBOMRelationships},
+
+		// Package Information - SHOULD
+		{Key: "comp_checksum", Name: "Package Checksum", Required: false, Description: "Component checksums", Evaluate: profiles.OCTV11CompChecksum},
+		{Key: "comp_purl", Name: "Package URL (PURL)", Required: false, Description: "Package URL identifier", Evaluate: profiles.OCTV11CompPURL},
+	},
+}
+
+var Profile = []catalog.ProfSpec{
+	profileNTIASpec,     // now CISA 2026 (latest NTIA)
+	profileNTIA2021Spec, // legacy NTIA 2021
+	profileNTIA2025Spec,
+	profileBSI11Spec,
+	profileBSI20Spec,
+	profileBSI21Spec,
+	profileOCTV11Spec,
+	profileInterlynkSpec,
+	profileFSCTSpec,
+}
+
+// ProfileSpecsMap provides easy access to profile specifications by key
+var ProfileSpecsMap = map[string]catalog.ProfSpec{
+	"ntia":      profileNTIASpec, // NTIA Minimum Elements (2026)
+	"ntia-2021": profileNTIA2021Spec,
+	"ntia-2025": profileNTIA2025Spec,
+	"bsi-v1.1":  profileBSI11Spec,
+	"bsi-v2.0":  profileBSI20Spec,
+	"bsi-v2.1":  profileBSI21Spec,
+	"bsi":       profileBSI21Spec,
+	"oct-v1.1":  profileOCTV11Spec,
+	"fsct":      profileFSCTSpec,
+	"interlynk": profileInterlynkSpec,
+}
+
+// getProfileFeatureInfo looks up a feature in a profile spec and returns its metadata
+func getProfileFeatureInfo(profileKey string, featureKey string) (catalog.ProfFeatSpec, bool) {
+	profileSpec, ok := ProfileSpecsMap[profileKey]
+	if !ok {
+		return catalog.ProfFeatSpec{}, false
+	}
+
+	for _, feat := range profileSpec.Features {
+		if feat.Key == featureKey {
+			return feat, true
+		}
+	}
+
+	return catalog.ProfFeatSpec{}, false
+}

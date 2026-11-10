@@ -1,0 +1,134 @@
+// Copyright 2025 Interlynk.io
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package cmd
+
+import (
+	"context"
+	"fmt"
+	"log"
+
+	"github.com/google/uuid"
+	"github.com/interlynk-io/sbomqs/v2/pkg/engine"
+	"github.com/interlynk-io/sbomqs/v2/pkg/logger"
+	"github.com/spf13/cobra"
+	"go.uber.org/zap"
+)
+
+// dtrackScoreCmd represents the dtrackScore command for scoring SBOM quality from Dependency-Track projects.
+// It requires a Dependency-Track URL and API key to access and score projects by their UUID.
+var dtrackScoreCmd = &cobra.Command{
+	Use:          "dtrackScore <project-id>",
+	Aliases:      []string{"dt"},
+	Short:        "generate an sbom quality score for a given project id from dependency track",
+	Long:         `dtrackScore allows your to score the sbom quality of a project from dependency track.`,
+	SilenceUsage: true,
+	Args: func(cmd *cobra.Command, args []string) error {
+		if err := cobra.ExactArgs(1)(cmd, args); err != nil {
+			_ = cmd.Help()
+			return fmt.Errorf("require at least 1 argument as project ID")
+		}
+		return nil
+	},
+	RunE: func(cmd *cobra.Command, args []string) error {
+		debug, _ := cmd.Flags().GetBool("debug")
+
+		// Initialize logger once
+		logger.Init(debug)
+		defer logger.Sync()
+
+		ctx := logger.WithLogger(context.Background())
+
+		log := logger.FromContext(ctx)
+		log.Info("Dtrack Scoring started")
+
+		dtParams, err := extractArgs(cmd, args)
+		if err != nil {
+			log.Fatal("failed to extract args", zap.Error(err))
+		}
+
+		return engine.DtrackScore(ctx, dtParams)
+	},
+}
+
+func extractArgs(cmd *cobra.Command, args []string) (*engine.DtParams, error) {
+	params := &engine.DtParams{}
+
+	url, err := cmd.Flags().GetString("url")
+	if err != nil {
+		return nil, err
+	}
+
+	apiKey, err := cmd.Flags().GetString("api-key")
+	if err != nil {
+		return nil, err
+	}
+
+	json, _ := cmd.Flags().GetBool("json")
+	basic, _ := cmd.Flags().GetBool("basic")
+	detailed, _ := cmd.Flags().GetBool("detailed")
+	profile, _ := cmd.Flags().GetStringSlice("profile")
+
+	params.URL = url
+	params.APIKey = apiKey
+
+	params.JSON = json
+	params.Basic = basic
+	params.Detailed = detailed
+	params.Profile = profile
+
+	params.TagProjectWithScore, _ = cmd.Flags().GetBool("tag-project-with-score")
+	params.TagProjectWithGrade, _ = cmd.Flags().GetBool("tag-project-with-grade")
+
+	for _, arg := range args {
+		argID, err := uuid.Parse(arg)
+		if err != nil {
+			return nil, err
+		}
+		params.ProjectIDs = append(params.ProjectIDs, argID)
+	}
+
+	params.Timeout, _ = cmd.Flags().GetInt("timeout")
+	params.Legacy, _ = cmd.Flags().GetBool("legacy")
+
+	return params, nil
+}
+
+func init() {
+	rootCmd.AddCommand(dtrackScoreCmd)
+	dtrackScoreCmd.Flags().StringP("url", "u", "", "dependency track url https://localhost:8080/")
+	dtrackScoreCmd.Flags().StringP("api-key", "k", "", "dependency track api key, requires VIEW_PORTFOLIO for scoring and PORTFOLIO_MANAGEMENT for tagging")
+	err := dtrackScoreCmd.MarkFlagRequired("url")
+	if err != nil {
+		// Handle the error appropriately, such as logging it or returning it
+		log.Fatalf("Failed to mark flag as deprecated: %v", err)
+	}
+	err = dtrackScoreCmd.MarkFlagRequired("api-key")
+	if err != nil {
+		// Handle the error appropriately, such as logging it or returning it
+		log.Fatalf("Failed to mark flag as deprecated: %v", err)
+	}
+
+	dtrackScoreCmd.Flags().BoolP("debug", "D", false, "enable debug logging")
+
+	dtrackScoreCmd.Flags().BoolP("json", "j", false, "results in json")
+	dtrackScoreCmd.Flags().BoolP("detailed", "d", false, "results in table format, default")
+	dtrackScoreCmd.Flags().BoolP("basic", "b", false, "results in single line format")
+
+	dtrackScoreCmd.Flags().BoolP("tag-project-with-score", "s", false, "tag project with sbomqs score")
+	dtrackScoreCmd.Flags().BoolP("tag-project-with-grade", "g", false, "tag project with sbomqs grade")
+	dtrackScoreCmd.Flags().IntP("timeout", "i", 60, "Timeout in seconds for Dependency-Track API requests")
+	dtrackScoreCmd.Flags().BoolP("legacy", "l", false, "legacy, prior to sbomqs version 2.0")
+	dtrackScoreCmd.Flags().StringSlice("profile", nil, "profiles to run ('ntia' (CISA-2026), 'ntia-2021'|'ntia2021'|'cisa-2021'|'cisa2021', 'cisa-2026'|'cisa'|'cisa2026', 'fsct', 'bsi', 'bsi-v1.1'|'bsiv11', 'bsi-v2.0'|'bsiv20', 'bsi-v2.1'|'bsiv21', 'oct-v1.1'|'octv11'|'oct', 'interlynk')")
+}

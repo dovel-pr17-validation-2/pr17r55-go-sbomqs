@@ -1,0 +1,49 @@
+// Copyright 2025 Interlynk.io
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package sbom
+
+//counterfeiter:generate . GetExternalReference
+
+// GetExternalReference defines the interface for accessing external reference information in SBOMs
+type GetExternalReference interface {
+	// GetRefType returns the type of the external reference (e.g., website, vcs, etc.)
+	GetRefType() string
+	// GetRefLocator returns the locator/URL of the external reference
+	GetRefLocator() string
+	// GetRefHashes returns the cryptographic hashes associated with the external reference
+	GetRefHashes() []GetChecksum
+}
+
+// ExternalReference represents a concrete implementation of external reference information
+type ExternalReference struct {
+	RefType    string
+	RefLocator string
+	RefHashes  []GetChecksum
+}
+
+// GetRefType returns the type of the external reference (e.g., website, vcs, etc.)
+func (e ExternalReference) GetRefType() string {
+	return e.RefType
+}
+
+// GetRefLocator returns the locator/URL of the external reference
+func (e ExternalReference) GetRefLocator() string {
+	return e.RefLocator
+}
+
+// GetRefHashes returns the cryptographic hashes associated with the external reference
+func (e ExternalReference) GetRefHashes() []GetChecksum {
+	return e.RefHashes
+}
