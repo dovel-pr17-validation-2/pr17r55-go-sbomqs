@@ -7,7 +7,7 @@ require (
 	github.com/DependencyTrack/client-go v0.19.0
 	github.com/fatih/color v1.19.0
 	github.com/github/go-spdx/v2 v2.7.0
-	github.com/go-git/go-billy/v5 v5.9.1
+	github.com/go-git/go-billy/v5 v5.9.2
 	github.com/google/uuid v1.6.0
 	github.com/interlynk-io/spdx-zen v0.1.5
 	github.com/knqyf263/go-cpe v0.0.0-20230627041855-cb0794d06872
